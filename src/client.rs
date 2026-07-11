@@ -1,8 +1,13 @@
 use crate::{
-    Error, Message, Result, Route,
-    contract::PeerEvent,
-    wire::{frame_payload, read_frame, serialize_payload},
+    Error, Message, Result, Route, decode_message,
+    wire::{
+        FLAG_BINARY, Frame, FrameReader, MAX_WRITE_BATCH, begin_publish_frame, encode_close_bridge,
+        encode_hello, encode_open_bridge, encode_subscribe, encode_unsubscribe, finish_frame,
+        route_flags, write_frames,
+    },
 };
+use arc_swap::ArcSwapOption;
+use bytes::BufMut;
 use serde::Serialize;
 use socket2::TcpKeepalive;
 use std::{
@@ -12,13 +17,12 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::AsyncWriteExt,
     net::{
         TcpStream,
         tcp::{OwnedReadHalf, OwnedWriteHalf},
     },
     sync::{
-        Mutex, RwLock,
+        Mutex,
         mpsc::{self, Receiver, Sender, error::TryRecvError},
     },
 };
@@ -27,8 +31,6 @@ const RECONNECTION_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_RECONNECTION_BACKOFF: Duration = Duration::from_secs(30);
 const INBOUND_QUEUE_CAPACITY: usize = 1024;
 const OUTBOUND_QUEUE_CAPACITY: usize = 1024;
-
-type ReceiverSlot = Arc<Mutex<Option<Receiver<Message>>>>;
 
 #[derive(Debug, Clone)]
 pub struct ClientSettings {
@@ -55,63 +57,68 @@ impl Default for ClientSettings {
 
 #[derive(Clone)]
 pub struct Client {
-    state: Arc<RwLock<ClientState>>,
-    settings: ClientSettings,
+    shared: Arc<ClientShared>,
 }
 
-struct ClientState {
-    id: String,
-    outbound: Option<Sender<Vec<u8>>>,
-    receiver: ReceiverSlot,
+struct ClientShared {
+    id: Box<str>,
+    settings: ClientSettings,
+    connection: ArcSwapOption<Connection>,
+    receiver: Mutex<Option<Receiver<Message>>>,
+    cold: Mutex<ColdState>,
+}
+
+struct Connection {
+    outbound: Sender<Frame>,
+}
+
+struct ColdState {
     subscriptions: HashSet<String>,
     pending_subscriptions: HashSet<String>,
-    read_timeout: Option<Duration>,
     broker_address: Option<String>,
     reconnection_task_spawned: bool,
 }
 
 pub fn create_client(name: &str, settings: ClientSettings) -> Client {
-    let id = format!("{name}_{}", uuid::Uuid::new_v4());
-    let read_timeout = settings.read_timeout;
+    create_client_with_id(format!("{name}_{}", uuid::Uuid::new_v4()), settings)
+}
+
+pub(crate) fn create_client_with_id(id: String, settings: ClientSettings) -> Client {
     Client {
-        state: Arc::new(RwLock::new(ClientState {
-            id,
-            outbound: None,
-            receiver: Arc::new(Mutex::new(None)),
-            subscriptions: HashSet::new(),
-            pending_subscriptions: HashSet::new(),
-            read_timeout,
-            broker_address: None,
-            reconnection_task_spawned: false,
-        })),
-        settings,
+        shared: Arc::new(ClientShared {
+            id: id.into(),
+            settings,
+            connection: ArcSwapOption::empty(),
+            receiver: Mutex::new(None),
+            cold: Mutex::new(ColdState {
+                subscriptions: HashSet::new(),
+                pending_subscriptions: HashSet::new(),
+                broker_address: None,
+                reconnection_task_spawned: false,
+            }),
+        }),
     }
 }
 
-pub async fn client_id(client: &Client) -> String {
-    client.state.read().await.id.clone()
-}
-
-pub(crate) async fn assign_client_id(client: &Client, id: &str) {
-    client.state.write().await.id = id.to_string();
+pub fn client_id(client: &Client) -> &str {
+    &client.shared.id
 }
 
 pub async fn is_connected(client: &Client) -> bool {
-    let receiver_slot = {
-        let state = client.state.read().await;
-        if state.outbound.is_none() {
-            return false;
-        }
-        state.receiver.clone()
+    let Some(connection) = client.shared.connection.load_full() else {
+        return false;
     };
-    let receiver_guard = receiver_slot.lock().await;
+    if connection.outbound.is_closed() {
+        return false;
+    }
+    let receiver_guard = client.shared.receiver.lock().await;
     receiver_guard
         .as_ref()
         .is_some_and(|receiver| !receiver.is_closed())
 }
 
 pub async fn subscriptions(client: &Client) -> HashSet<String> {
-    client.state.read().await.subscriptions.clone()
+    client.shared.cold.lock().await.subscriptions.clone()
 }
 
 /// Connects to a broker. With `autoreconnect` enabled the client also
@@ -119,23 +126,13 @@ pub async fn subscriptions(client: &Client) -> HashSet<String> {
 /// subscriptions, but it does not replay messages published to those topics
 /// while it was disconnected; any such messages are lost.
 pub async fn connect(client: &Client, address: &str) -> Result<()> {
-    client.state.write().await.broker_address = Some(address.to_string());
-    establish_connection(
-        &client.state,
-        address,
-        client.settings.max_connection_attempts,
-        client.settings.timeout_per_attempt,
-    )
-    .await?;
-    if client.settings.autoreconnect {
-        let mut state = client.state.write().await;
-        if !state.reconnection_task_spawned {
-            state.reconnection_task_spawned = true;
-            tokio::spawn(reconnection_task(
-                Arc::downgrade(&client.state),
-                client.settings.max_connection_attempts,
-                client.settings.timeout_per_attempt,
-            ));
+    client.shared.cold.lock().await.broker_address = Some(address.to_string());
+    establish_connection(&client.shared, address).await?;
+    if client.shared.settings.autoreconnect {
+        let mut cold = client.shared.cold.lock().await;
+        if !cold.reconnection_task_spawned {
+            cold.reconnection_task_spawned = true;
+            tokio::spawn(reconnection_task(Arc::downgrade(&client.shared)));
         }
     }
     Ok(())
@@ -147,8 +144,10 @@ pub async fn publish(
     payload: &impl Serialize,
     route: Route,
 ) -> Result<()> {
-    let payload_json = serde_json::to_string(payload)?;
-    publish_json(client, topic, &payload_json, route).await
+    let mut buffer = begin_publish_frame(topic.as_ref(), route_flags(route == Route::Local))?;
+    serde_json::to_writer((&mut buffer).writer(), payload)?;
+    let frame = finish_frame(buffer)?;
+    send_frame(&client.shared, Frame::single(frame)).await
 }
 
 pub async fn publish_json(
@@ -157,13 +156,10 @@ pub async fn publish_json(
     payload: &str,
     route: Route,
 ) -> Result<()> {
-    let publish_event = PeerEvent::PublishText {
-        id: client.state.read().await.id.clone(),
-        topic: topic.as_ref().to_string(),
-        payload: payload.to_string(),
-        local_only: matches!(route, Route::Local),
-    };
-    send_event(&client.state, &publish_event).await
+    let mut buffer = begin_publish_frame(topic.as_ref(), route_flags(route == Route::Local))?;
+    buffer.put_slice(payload.as_bytes());
+    let frame = finish_frame(buffer)?;
+    send_frame(&client.shared, Frame::single(frame)).await
 }
 
 pub async fn publish_bytes(
@@ -172,81 +168,40 @@ pub async fn publish_bytes(
     payload: &[u8],
     route: Route,
 ) -> Result<()> {
-    let publish_event = PeerEvent::PublishBinary {
-        id: client.state.read().await.id.clone(),
-        topic: topic.as_ref().to_string(),
-        payload: payload.to_vec(),
-        local_only: matches!(route, Route::Local),
-    };
-    send_event(&client.state, &publish_event).await
-}
-
-pub(crate) async fn forward_text(
-    client: &Client,
-    topic: &str,
-    payload: &str,
-    visited: Vec<String>,
-    sequence: u64,
-) -> Result<()> {
-    let forward_event = PeerEvent::ForwardText {
-        id: client.state.read().await.id.clone(),
-        topic: topic.to_string(),
-        payload: payload.to_string(),
-        local_only: false,
-        visited,
-        sequence,
-    };
-    send_event(&client.state, &forward_event).await
-}
-
-pub(crate) async fn forward_bytes(
-    client: &Client,
-    topic: &str,
-    payload: &[u8],
-    visited: Vec<String>,
-    sequence: u64,
-) -> Result<()> {
-    let forward_event = PeerEvent::ForwardBinary {
-        id: client.state.read().await.id.clone(),
-        topic: topic.to_string(),
-        payload: payload.to_vec(),
-        local_only: false,
-        visited,
-        sequence,
-    };
-    send_event(&client.state, &forward_event).await
+    let mut buffer = begin_publish_frame(
+        topic.as_ref(),
+        FLAG_BINARY | route_flags(route == Route::Local),
+    )?;
+    buffer.put_slice(payload);
+    let frame = finish_frame(buffer)?;
+    send_frame(&client.shared, Frame::single(frame)).await
 }
 
 pub async fn subscribe(client: &Client, topics: &[impl AsRef<str>]) -> Result<()> {
     for topic in topics {
         let topic = topic.as_ref();
-        let event = {
-            let mut state = client.state.write().await;
-            if state.outbound.is_none() {
-                state.pending_subscriptions.insert(topic.to_string());
-                None
-            } else {
-                Some(PeerEvent::Subscribe {
-                    id: state.id.clone(),
-                    topic: topic.to_string(),
-                })
+        {
+            let mut cold = client.shared.cold.lock().await;
+            if client.shared.connection.load_full().is_none() {
+                cold.pending_subscriptions.insert(topic.to_string());
+                continue;
             }
-        };
-        let Some(event) = event else {
-            continue;
-        };
-        if let Err(error) = send_event(&client.state, &event).await {
+        }
+        let frame = Frame::single(encode_subscribe(topic)?);
+        if let Err(error) = send_frame(&client.shared, frame).await {
             client
-                .state
-                .write()
+                .shared
+                .cold
+                .lock()
                 .await
                 .pending_subscriptions
                 .insert(topic.to_string());
             return Err(error);
         }
         client
-            .state
-            .write()
+            .shared
+            .cold
+            .lock()
             .await
             .subscriptions
             .insert(topic.to_string());
@@ -257,21 +212,14 @@ pub async fn subscribe(client: &Client, topics: &[impl AsRef<str>]) -> Result<()
 pub async fn unsubscribe(client: &Client, topics: &[impl AsRef<str>]) -> Result<()> {
     for topic in topics {
         let topic = topic.as_ref();
-        let event = {
-            let mut state = client.state.write().await;
-            state.pending_subscriptions.remove(topic);
-            state.subscriptions.remove(topic);
-            if state.outbound.is_none() {
-                None
-            } else {
-                Some(PeerEvent::Unsubscribe {
-                    id: state.id.clone(),
-                    topic: topic.to_string(),
-                })
-            }
+        let connected = {
+            let mut cold = client.shared.cold.lock().await;
+            cold.pending_subscriptions.remove(topic);
+            cold.subscriptions.remove(topic);
+            client.shared.connection.load_full().is_some()
         };
-        if let Some(event) = event {
-            send_event(&client.state, &event).await?;
+        if connected {
+            send_frame(&client.shared, Frame::single(encode_unsubscribe(topic)?)).await?;
         }
     }
     Ok(())
@@ -288,8 +236,7 @@ pub enum Reception {
 }
 
 pub async fn try_next_message(client: &Client) -> Reception {
-    let receiver_slot = client.state.read().await.receiver.clone();
-    let mut receiver_guard = receiver_slot.lock().await;
+    let mut receiver_guard = client.shared.receiver.lock().await;
     let Some(receiver) = receiver_guard.as_mut() else {
         return Reception::Disconnected;
     };
@@ -297,8 +244,7 @@ pub async fn try_next_message(client: &Client) -> Reception {
         Ok(message) => Reception::Message(message),
         Err(TryRecvError::Disconnected) => {
             *receiver_guard = None;
-            drop(receiver_guard);
-            client.state.write().await.outbound = None;
+            client.shared.connection.store(None);
             Reception::Disconnected
         }
         Err(TryRecvError::Empty) => Reception::Empty,
@@ -306,16 +252,13 @@ pub async fn try_next_message(client: &Client) -> Reception {
 }
 
 pub async fn next_message(client: &Client) -> Option<Message> {
-    let receiver_slot = client.state.read().await.receiver.clone();
-    let mut receiver_guard = receiver_slot.lock().await;
+    let mut receiver_guard = client.shared.receiver.lock().await;
     let receiver = receiver_guard.as_mut()?;
-    let received = receiver.recv().await;
-    match received {
+    match receiver.recv().await {
         Some(message) => Some(message),
         None => {
             *receiver_guard = None;
-            drop(receiver_guard);
-            client.state.write().await.outbound = None;
+            client.shared.connection.store(None);
             None
         }
     }
@@ -335,87 +278,79 @@ pub(crate) async fn open_bridge_acked(
     target_address: &str,
     ack: bool,
 ) -> Result<()> {
-    let bridge_event = PeerEvent::OpenBridge {
-        id: client.state.read().await.id.clone(),
-        source_address: source_address.to_string(),
-        target_address: target_address.to_string(),
-        ack,
-    };
-    send_event(&client.state, &bridge_event).await
+    let frame = encode_open_bridge(ack, source_address, target_address)?;
+    send_frame(&client.shared, Frame::single(frame)).await
 }
 
 pub async fn close_bridge(client: &Client, target_address: &str) -> Result<()> {
-    let close_event = PeerEvent::CloseBridge {
-        id: String::new(),
-        target_address: target_address.to_string(),
-        ack: false,
-    };
-    send_event(&client.state, &close_event).await
+    let frame = encode_close_bridge(false, target_address)?;
+    send_frame(&client.shared, Frame::single(frame)).await
 }
 
-pub(crate) async fn notify_close_bridge(client: &Client, id: &str) -> Result<()> {
-    let close_event = PeerEvent::CloseBridge {
-        id: id.to_string(),
-        target_address: String::new(),
-        ack: true,
-    };
-    send_event(&client.state, &close_event).await
+pub(crate) async fn notify_close_bridge(client: &Client) -> Result<()> {
+    let frame = encode_close_bridge(true, "")?;
+    send_frame(&client.shared, Frame::single(frame)).await
 }
 
-async fn establish_connection(
-    state: &Arc<RwLock<ClientState>>,
-    address: &str,
-    max_connection_attempts: Option<u16>,
-    timeout_per_attempt: Duration,
-) -> Result<()> {
-    let stream =
-        connect_with_retries(address, max_connection_attempts, timeout_per_attempt).await?;
-    let (read_half, write_half) = stream.into_split();
-    let (message_sender, message_receiver) = mpsc::channel(INBOUND_QUEUE_CAPACITY);
-    let (outbound_sender, outbound_receiver) = mpsc::channel(OUTBOUND_QUEUE_CAPACITY);
-    let (id, read_timeout, receiver_slot) = {
-        let mut guard = state.write().await;
-        guard.outbound = Some(outbound_sender);
-        (guard.id.clone(), guard.read_timeout, guard.receiver.clone())
+pub(crate) async fn send_bridge_frame(client: &Client, frame: Frame) -> Result<()> {
+    send_frame(&client.shared, frame).await
+}
+
+async fn send_frame(shared: &ClientShared, frame: Frame) -> Result<()> {
+    let Some(connection) = shared.connection.load_full() else {
+        return Err(Error::NotConnected);
     };
-    tokio::spawn(writer_task(write_half, outbound_receiver));
-    tokio::spawn(read_task(read_half, message_sender, read_timeout));
-    *receiver_slot.lock().await = Some(message_receiver);
-    let hello_event = PeerEvent::Hello { id };
-    send_event(state, &hello_event).await?;
-    resubscribe(state).await?;
+    if connection.outbound.send(frame).await.is_err() {
+        return Err(Error::NotConnected);
+    }
     Ok(())
 }
 
-async fn reconnection_task(
-    state: Weak<RwLock<ClientState>>,
-    max_connection_attempts: Option<u16>,
-    timeout_per_attempt: Duration,
-) {
+async fn establish_connection(shared: &Arc<ClientShared>, address: &str) -> Result<()> {
+    let stream = connect_with_retries(
+        address,
+        shared.settings.max_connection_attempts,
+        shared.settings.timeout_per_attempt,
+    )
+    .await?;
+    let (read_half, write_half) = stream.into_split();
+    let (message_sender, message_receiver) = mpsc::channel(INBOUND_QUEUE_CAPACITY);
+    let (outbound_sender, outbound_receiver) = mpsc::channel(OUTBOUND_QUEUE_CAPACITY);
+    tokio::spawn(writer_task(write_half, outbound_receiver));
+    tokio::spawn(read_task(
+        read_half,
+        message_sender,
+        shared.settings.read_timeout,
+    ));
+    *shared.receiver.lock().await = Some(message_receiver);
+    shared.connection.store(Some(Arc::new(Connection {
+        outbound: outbound_sender,
+    })));
+    send_frame(shared, Frame::single(encode_hello(&shared.id)?)).await?;
+    resubscribe(shared).await?;
+    Ok(())
+}
+
+async fn reconnection_task(shared: Weak<ClientShared>) {
     let mut backoff = RECONNECTION_INTERVAL;
     loop {
         tokio::time::sleep(backoff).await;
-        let Some(state_handle) = state.upgrade() else {
+        let Some(shared) = shared.upgrade() else {
             break;
         };
-        let (connected, address) = {
-            let guard = state_handle.read().await;
-            (guard.outbound.is_some(), guard.broker_address.clone())
-        };
+        let connected = shared
+            .connection
+            .load_full()
+            .is_some_and(|connection| !connection.outbound.is_closed());
         if connected {
             backoff = RECONNECTION_INTERVAL;
             continue;
         }
+        let address = shared.cold.lock().await.broker_address.clone();
         let Some(address) = address else {
             continue;
         };
-        let _ = establish_connection(
-            &state_handle,
-            &address,
-            max_connection_attempts,
-            timeout_per_attempt,
-        )
-        .await;
+        let _ = establish_connection(&shared, &address).await;
         backoff = (backoff * 2).min(MAX_RECONNECTION_BACKOFF);
     }
 }
@@ -478,24 +413,24 @@ fn configure_keepalive(stream: &TcpStream) -> Result<()> {
 }
 
 async fn read_task(
-    mut read_half: OwnedReadHalf,
+    read_half: OwnedReadHalf,
     message_sender: Sender<Message>,
     read_timeout: Option<Duration>,
 ) {
+    let mut reader = FrameReader::new(read_half);
     loop {
-        let message = match read_timeout {
-            Some(timeout_duration) => {
-                match tokio::time::timeout(timeout_duration, read_frame::<Message>(&mut read_half))
-                    .await
-                {
-                    Ok(Ok(message)) => message,
-                    _ => break,
-                }
-            }
-            None => match read_frame::<Message>(&mut read_half).await {
-                Ok(message) => message,
+        let frame = match read_timeout {
+            Some(limit) => match tokio::time::timeout(limit, reader.next_frame()).await {
+                Ok(Ok(frame)) => frame,
+                _ => break,
+            },
+            None => match reader.next_frame().await {
+                Ok(frame) => frame,
                 Err(_) => break,
             },
+        };
+        let Some(message) = decode_message(frame.freeze()) else {
+            break;
         };
         if message_sender.send(message).await.is_err() {
             break;
@@ -503,46 +438,36 @@ async fn read_task(
     }
 }
 
-async fn writer_task(mut write_half: OwnedWriteHalf, mut outbound: Receiver<Vec<u8>>) {
+async fn writer_task(mut write_half: OwnedWriteHalf, mut outbound: Receiver<Frame>) {
+    let mut frames: Vec<Frame> = Vec::with_capacity(MAX_WRITE_BATCH);
     while let Some(frame) = outbound.recv().await {
-        if write_half.write_all(&frame).await.is_err() {
+        frames.clear();
+        frames.push(frame);
+        while frames.len() < MAX_WRITE_BATCH
+            && let Ok(next) = outbound.try_recv()
+        {
+            frames.push(next);
+        }
+        if write_frames(&mut write_half, &frames).await.is_err() {
             break;
         }
     }
 }
 
-async fn send_event(state: &Arc<RwLock<ClientState>>, event: &PeerEvent) -> Result<()> {
-    let frame = frame_payload(&serialize_payload(event)?);
-    let outbound = state.read().await.outbound.clone();
-    let Some(outbound) = outbound else {
-        return Err(Error::NotConnected);
-    };
-    if outbound.send(frame).await.is_err() {
-        state.write().await.outbound = None;
-        return Err(Error::NotConnected);
-    }
-    Ok(())
-}
-
-async fn resubscribe(state: &Arc<RwLock<ClientState>>) -> Result<()> {
+async fn resubscribe(shared: &Arc<ClientShared>) -> Result<()> {
     let topics: HashSet<String> = {
-        let guard = state.read().await;
-        guard
-            .subscriptions
+        let cold = shared.cold.lock().await;
+        cold.subscriptions
             .iter()
             .cloned()
-            .chain(guard.pending_subscriptions.iter().cloned())
+            .chain(cold.pending_subscriptions.iter().cloned())
             .collect()
     };
     for topic in topics {
-        let subscribe_event = PeerEvent::Subscribe {
-            id: state.read().await.id.clone(),
-            topic: topic.clone(),
-        };
-        send_event(state, &subscribe_event).await?;
-        let mut guard = state.write().await;
-        guard.subscriptions.insert(topic.clone());
-        guard.pending_subscriptions.remove(&topic);
+        send_frame(shared, Frame::single(encode_subscribe(&topic)?)).await?;
+        let mut cold = shared.cold.lock().await;
+        cold.subscriptions.insert(topic.clone());
+        cold.pending_subscriptions.remove(&topic);
     }
     Ok(())
 }

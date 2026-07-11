@@ -47,7 +47,7 @@ async fn batch_flushes_at_max_items() -> hearsay::Result<()> {
     let message = tokio::time::timeout(Duration::from_secs(5), next_message(&subscriber))
         .await?
         .expect("expected a batch message");
-    assert_eq!(message.topic, "updates/size");
+    assert_eq!(message.topic(), "updates/size");
     let updates: Vec<EntityUpdate> = read_batch(&message)?;
     assert_eq!(updates, sample_updates(3));
     Ok(())

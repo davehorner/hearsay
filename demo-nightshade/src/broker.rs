@@ -133,7 +133,7 @@ async fn broker_runtime_loop(
         });
         return;
     }
-    let client_id = hearsay::client_id(&client).await;
+    let client_id = hearsay::client_id(&client).to_string();
     let _ = event_sender.send(RuntimeEvent::Connected {
         client_id,
         address: address.clone(),
@@ -153,9 +153,9 @@ async fn broker_runtime_loop(
                 inbound = hearsay::next_message(&mut client) => match inbound {
                     Some(message) => {
                         let _ = event_sender.send(RuntimeEvent::Inbound {
-                            topic: message.topic,
-                            payload: message.payload,
-                            bytes: message.bytes,
+                            topic: message.topic().to_string(),
+                            payload: message.text().unwrap_or_default().to_string(),
+                            bytes: message.bytes().map(<[u8]>::to_vec),
                         });
                     }
                     None => {
@@ -175,7 +175,7 @@ async fn broker_runtime_loop(
                 _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
                     if hearsay::is_connected(&client).await {
                         connected = true;
-                        let client_id = hearsay::client_id(&client).await;
+                        let client_id = hearsay::client_id(&client).to_string();
                         let _ = event_sender.send(RuntimeEvent::Connected {
                             client_id,
                             address: address.clone(),

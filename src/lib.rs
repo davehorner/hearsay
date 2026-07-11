@@ -1,5 +1,7 @@
 //! Topic-based pub/sub messaging over TCP, built on tokio.
 
+#[cfg(not(target_arch = "wasm32"))]
+mod arena;
 mod batch;
 #[cfg(not(target_arch = "wasm32"))]
 mod bridge;
@@ -14,12 +16,19 @@ mod lifecycle;
 mod spawn;
 #[cfg(all(feature = "websockets", not(target_arch = "wasm32")))]
 mod websocket;
-#[cfg(not(target_arch = "wasm32"))]
 mod wire;
 
+pub use bytes::Bytes;
 pub use enum2contract;
 
-pub use self::{batch::*, contract::*};
+pub use self::{
+    batch::*,
+    contract::*,
+    wire::{
+        Message, decode_message, encode_hello, encode_publish_binary, encode_publish_text,
+        encode_subscribe, encode_unsubscribe,
+    },
+};
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use self::{broker::*, client::*, lifecycle::*};
@@ -36,6 +45,7 @@ pub enum Error {
     MaxConnectionAttempts,
     AddressResolution,
     FrameTooLarge,
+    TopicTooLong,
     AppNotFound(String),
     AppAlreadyRunning(String),
     Serialization(String),
@@ -52,6 +62,7 @@ impl std::fmt::Display for Error {
             }
             Error::AddressResolution => write!(formatter, "could not resolve address"),
             Error::FrameTooLarge => write!(formatter, "frame length exceeds maximum"),
+            Error::TopicTooLong => write!(formatter, "topic or identifier exceeds maximum length"),
             Error::AppNotFound(name) => write!(formatter, "app '{name}' not found"),
             Error::AppAlreadyRunning(name) => write!(formatter, "app '{name}' is already running"),
             Error::Serialization(message) => write!(formatter, "serialization error: {message}"),

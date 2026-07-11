@@ -59,7 +59,7 @@ impl Lifecycle for Responder {
     }
 
     async fn receive_message(&mut self, message: &Message, client: &Client) -> Option<Interrupt> {
-        match message.topic.as_str() {
+        match message.topic() {
             topic if PingPongContract::command_topic(PingPongContract::BROADCAST) == topic => {
                 let Ok(payload) = CommandPayload::from_json(message.text().unwrap_or_default())
                 else {
@@ -165,7 +165,7 @@ async fn run_requester() -> hearsay::Result<()> {
         let Ok(Some(message)) = received else {
             continue;
         };
-        if message.topic != PingPongContract::event_topic(PingPongContract::BROADCAST) {
+        if message.topic() != PingPongContract::event_topic(PingPongContract::BROADCAST) {
             continue;
         }
         let Ok(event_payload) = EventPayload::from_json(message.text().unwrap_or_default()) else {

@@ -1,10 +1,11 @@
 use crate::{
     Result,
-    broker::{Broker, BrokerEvent, PeerWriter, WebSocketSink, forward_peer_event, resolve_address},
-    contract::PeerEvent,
+    arena::PeerId,
+    broker::{Broker, BrokerEvent, PeerWriter, process_incoming_frame, resolve_address},
 };
+use bytes::BytesMut;
 use futures_util::StreamExt;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::{mpsc::Sender, watch},
@@ -44,18 +45,27 @@ async fn websocket_connection_task(event_sender: Sender<BrokerEvent>, stream: Tc
         return;
     };
     let (sink, mut messages) = websocket.split();
-    let mut writer: Option<PeerWriter> = Some(Box::new(WebSocketSink(sink)));
+    let mut writer: Option<PeerWriter> = Some(PeerWriter::WebSocket(sink));
+    let mut peer: Option<(PeerId, Arc<str>)> = None;
     let mut shutdown_signal = None;
     while let Some(Ok(message)) = messages.next().await {
-        let event = match message {
-            tungstenite::Message::Binary(data) => match postcard::from_bytes::<PeerEvent>(&data) {
-                Ok(event) => event,
-                Err(_) => continue,
+        let frame = match message {
+            tungstenite::Message::Binary(data) => match data.try_into_mut() {
+                Ok(frame) => frame,
+                Err(shared) => BytesMut::from(&shared[..]),
             },
             tungstenite::Message::Close(_) => break,
             _ => continue,
         };
-        if !forward_peer_event(event, &event_sender, &mut writer, &mut shutdown_signal).await {
+        if !process_incoming_frame(
+            frame,
+            &event_sender,
+            &mut writer,
+            &mut peer,
+            &mut shutdown_signal,
+        )
+        .await
+        {
             break;
         }
     }

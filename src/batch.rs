@@ -1,5 +1,5 @@
 #[cfg(not(target_arch = "wasm32"))]
-use crate::{Client, Route, publish_bytes, wire::serialize_payload};
+use crate::{Client, Route, publish_bytes};
 use crate::{Message, Result};
 #[cfg(not(target_arch = "wasm32"))]
 use serde::Serialize;
@@ -52,7 +52,7 @@ pub async fn flush_batch<T: Serialize>(client: &Client, batch: &mut Batch<T>) ->
     if batch.items.is_empty() {
         return Ok(());
     }
-    let payload = serialize_payload(&batch.items)?;
+    let payload = postcard::to_allocvec(&batch.items)?;
     publish_bytes(client, &batch.topic, &payload, batch.route).await?;
     batch.items.clear();
     batch.last_flush = Instant::now();

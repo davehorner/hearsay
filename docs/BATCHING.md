@@ -34,7 +34,7 @@ A useful property of the elapsed-time trigger: the first item pushed after an id
 
 ## 3. Wire format
 
-A flush serializes `Vec<T>` with postcard and publishes it via `publish_bytes`, so subscribers receive a `Message` with `bytes` populated and `payload` empty. `read_batch` is the inverse. The 64 MiB frame cap bounds the worst-case batch; a batch that would exceed it fails to serialize and is kept (see below) rather than sent.
+A flush serializes `Vec<T>` with postcard and publishes it via `publish_bytes`, so subscribers receive a binary `Message` (its payload comes through `bytes()`, and `text()` is `None`). `read_batch` is the inverse. The 64 MiB frame cap bounds the worst-case batch; a batch that would exceed it fails to serialize and is kept (see below) rather than sent.
 
 ## 4. Failure semantics
 

@@ -135,8 +135,10 @@ pub fn on_connected(state: DemoState, link: HearsaySlot) {
 /// shell topic.
 pub fn handle_shell_topic(state: DemoState, link: HearsaySlot, message: &hearsay::Message) -> bool {
     let shell_id = state.shell_id.get_value();
-    if state.is_primary && message.topic == ANNOUNCE_TOPIC {
-        if let Ok(payload) = serde_json::from_str::<AnnouncePayload>(&message.payload) {
+    if state.is_primary && message.topic() == ANNOUNCE_TOPIC {
+        if let Ok(payload) =
+            serde_json::from_str::<AnnouncePayload>(message.text().unwrap_or_default())
+        {
             state.known_windows.update(|windows| {
                 if !windows.contains(&payload.window_id) {
                     windows.push(payload.window_id.clone());
@@ -154,8 +156,10 @@ pub fn handle_shell_topic(state: DemoState, link: HearsaySlot, message: &hearsay
         }
         return true;
     }
-    if state.is_primary && message.topic == REPORT_LAYOUT_TOPIC {
-        if let Ok(payload) = serde_json::from_str::<ReportPayload>(&message.payload) {
+    if state.is_primary && message.topic() == REPORT_LAYOUT_TOPIC {
+        if let Ok(payload) =
+            serde_json::from_str::<ReportPayload>(message.text().unwrap_or_default())
+        {
             let complete = state
                 .collection
                 .try_update_value(|collection| {
@@ -175,13 +179,15 @@ pub fn handle_shell_topic(state: DemoState, link: HearsaySlot, message: &hearsay
         }
         return true;
     }
-    if !state.is_primary && message.topic == assign_topic(&shell_id) {
-        if let Ok(layout) = serde_json::from_str::<WindowLayout>(&message.payload) {
+    if !state.is_primary && message.topic() == assign_topic(&shell_id) {
+        if let Ok(layout) =
+            serde_json::from_str::<WindowLayout>(message.text().unwrap_or_default())
+        {
             state.apply_layout(&layout);
         }
         return true;
     }
-    if !state.is_primary && message.topic == REQUEST_LAYOUTS_TOPIC {
+    if !state.is_primary && message.topic() == REQUEST_LAYOUTS_TOPIC {
         let payload = ReportPayload {
             window_id: shell_id,
             layout: state.current_layout(),
@@ -421,14 +427,14 @@ pub fn clear_recent_projects(state: DemoState) {
 pub fn handle_panel_topics(state: DemoState, bridge: BridgeSlot, message: &hearsay::Message) {
     use crate::hearsay_link::{BINARY_TOPIC, SPAWN_TOPIC as CUBE_TOPIC, TEXT_TOPIC};
     const MAX_RECEIVED_MESSAGES: usize = 25;
-    match message.topic.as_str() {
+    match message.topic() {
         TEXT_TOPIC => {
             for panel in state.panels.get_untracked() {
                 if !panel.subscribed.get_untracked() {
                     continue;
                 }
                 panel.received_text.update(|received| {
-                    received.push(message.payload.clone());
+                    received.push(message.text().unwrap_or_default().to_string());
                     if received.len() > MAX_RECEIVED_MESSAGES {
                         let excess = received.len() - MAX_RECEIVED_MESSAGES;
                         received.drain(0..excess);
@@ -437,7 +443,7 @@ pub fn handle_panel_topics(state: DemoState, bridge: BridgeSlot, message: &hears
             }
         }
         BINARY_TOPIC => {
-            if let Some(bytes) = &message.bytes {
+            if let Some(bytes) = message.bytes() {
                 for panel in state.panels.get_untracked() {
                     if !panel.subscribed.get_untracked() {
                         continue;

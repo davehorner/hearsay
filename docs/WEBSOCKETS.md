@@ -11,25 +11,21 @@ let broker = hearsay::start_broker("127.0.0.1:9612").await?;
 hearsay::start_websocket_listener(&broker, "127.0.0.1:9613").await?;
 ```
 
-`start_websocket_listener` binds its own address, resolved the same way as the TCP listener (standard host resolution, IPv4 preferred, so `localhost` binds loopback and `0.0.0.0` is the explicit all-interfaces opt-in), and spawns an accept loop that feeds the same broker event channel as the TCP listener. Each accepted connection goes through the tungstenite handshake and then `websocket_connection_task`, which mirrors the TCP connection task: it decodes incoming events, forwards them via the shared `forward_peer_event`, and parks the sink half as the peer's writer (`PeerWriter::WebSocket`).
+`start_websocket_listener` binds its own address, resolved the same way as the TCP listener (standard host resolution, IPv4 preferred, so `localhost` binds loopback and `0.0.0.0` is the explicit all-interfaces opt-in), and spawns an accept loop that feeds the same broker event channel as the TCP listener. Each accepted connection goes through the tungstenite handshake and then `websocket_connection_task`, which mirrors the TCP connection task: it parses incoming frames, forwards them via the shared `process_incoming_frame`, and parks the sink half as the peer's writer (`PeerWriter::WebSocket`).
 
 ## 2. Wire format
 
-The protocol is identical to TCP except for framing (see [CONTRACTS.md](CONTRACTS.md)):
+The protocol is byte-identical to TCP (see [CONTRACTS.md](CONTRACTS.md)): each **binary** WebSocket message carries one complete hearsay frame, including the 4-byte length prefix, so the broker fans the same shared buffer out to TCP and WebSocket peers alike.
 
-- Client to broker: each **binary** WebSocket frame is one postcard-encoded `PeerEvent`. No length prefix; WebSocket frames are self-delimiting.
-- Broker to client: each binary frame is one postcard-encoded `Message`.
-- Text frames and pings are ignored; a close frame ends the session. Undecodable binary frames are skipped rather than killing the connection.
+- Text frames and pings are ignored; a close frame ends the session. A malformed binary frame kills the connection, the same as on TCP.
 - tungstenite's default 64 MiB message cap matches the library's own frame cap.
 
 A session looks like:
 
-1. Send `PeerEvent::Hello { id }` (binary, postcard).
-2. Send `PeerEvent::Subscribe { id, topic }` per topic.
-3. Send `PeerEvent::PublishText { .. }` / `PeerEvent::PublishBinary { .. }` to publish.
-4. Read binary frames and decode each as `Message`.
-
-Events are encoded with `postcard::to_allocvec(&event)` and incoming frames decoded with `postcard::from_bytes::<Message>(&bytes)`.
+1. Send `encode_hello(id)`.
+2. Send `encode_subscribe(topic)` per topic.
+3. Send `encode_publish_text(..)` / `encode_publish_binary(..)` to publish.
+4. Read binary frames and decode each with `decode_message`.
 
 `tests/websocket.rs` is the reference implementation of a WebSocket peer (using tokio-tungstenite as the client) and verifies both directions interoperate with a TCP peer through one broker.
 
@@ -39,4 +35,4 @@ A WebSocket peer gets the same writer task, shutdown oneshot, and generation-che
 
 ## 4. WASM clients
 
-A browser client implements the four-step session above over the platform WebSocket API, and it depends on hearsay itself for the wire format: on `wasm32` targets the crate compiles down to the protocol surface (`PeerEvent`, `Message`, `BrokerContract` and its payloads, and `read_batch`), with all the tokio-backed machinery and its dependencies compiled out. There is no type mirroring and no gateway process: the WASM client serializes `PeerEvent`s with postcard, sends them as binary frames, and deserializes incoming frames as `Message`. CI checks the wasm32 build on every push.
+A browser client implements the four-step session above over the platform WebSocket API, and it depends on hearsay itself for the wire format: on `wasm32` targets the crate compiles down to the protocol surface (the `encode_*` helpers, `decode_message`, `Message`, `BrokerContract` and its payloads, and `read_batch`), with all the tokio-backed machinery and its dependencies compiled out. There is no byte-format mirroring and no gateway process: the WASM client builds frames with the helpers, sends them as binary messages, and decodes incoming binary messages with `decode_message`. CI checks the wasm32 build on every push.

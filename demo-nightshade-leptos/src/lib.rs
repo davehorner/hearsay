@@ -6,7 +6,8 @@
 //! - `src/bridge.rs` spawns the worker and converts `WorkerMessage`s into
 //!   signal writes, and `ClientMessage`s into `postMessage` envelopes.
 //! - `src/hearsay_link.rs` is the hearsay peer: a WebSocket session against
-//!   the broker speaking postcard-encoded `PeerEvent`/`Message` frames.
+//!   the broker speaking hearsay wire frames via the `hearsay::encode_*`
+//!   and `hearsay::decode_message` helpers.
 //! - `src/shell.rs` is the multi-window shell: role detection, the shell
 //!   contract topics, and project/layout persistence.
 //! - `src/state.rs` is all page state, grouped as `Copy` signals.

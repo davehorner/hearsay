@@ -35,7 +35,7 @@ async fn count_bridges(broker_address: &str) -> usize {
             let Some(message) = next_message(&inspector).await else {
                 continue;
             };
-            if message.topic == BrokerContract::report_bridges_topic() {
+            if message.topic() == BrokerContract::report_bridges_topic() {
                 return message;
             }
         }
@@ -86,7 +86,7 @@ async fn bridged_brokers_deliver_messages() -> hearsay::Result<()> {
             let Some(message) = next_message(&first_client).await else {
                 continue;
             };
-            if message.topic == topic {
+            if message.topic() == topic {
                 return message;
             }
         }
@@ -135,7 +135,7 @@ async fn local_route_does_not_cross_bridges() -> hearsay::Result<()> {
             let Some(message) = next_message(&local_subscriber).await else {
                 continue;
             };
-            if message.topic == topic {
+            if message.topic() == topic {
                 return message;
             }
         }
@@ -149,7 +149,7 @@ async fn local_route_does_not_cross_bridges() -> hearsay::Result<()> {
             let Some(message) = next_message(&remote_subscriber).await else {
                 continue;
             };
-            if message.topic == topic {
+            if message.topic() == topic {
                 return message;
             }
         }
@@ -198,7 +198,7 @@ async fn bidirectional_bridge_delivers_each_message_once() -> hearsay::Result<()
             let Some(message) = next_message(&first_client).await else {
                 continue;
             };
-            if message.topic == topic {
+            if message.topic() == topic {
                 deliveries += 1;
             }
         }
@@ -283,7 +283,7 @@ async fn mesh_paths_deliver_each_message_once() -> hearsay::Result<()> {
             let Some(message) = next_message(&consumer).await else {
                 continue;
             };
-            if message.topic == topic {
+            if message.topic() == topic {
                 deliveries += 1;
             }
         }
@@ -322,7 +322,7 @@ async fn bridge_creation_is_announced() -> hearsay::Result<()> {
             let Some(message) = next_message(&first_client).await else {
                 continue;
             };
-            if message.topic == BrokerContract::bridge_created_topic() {
+            if message.topic() == BrokerContract::bridge_created_topic() {
                 return message;
             }
         }

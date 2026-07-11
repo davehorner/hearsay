@@ -72,7 +72,7 @@ async fn contract_command_and_event_round_trip() -> hearsay::Result<()> {
     let message = tokio::time::timeout(Duration::from_secs(5), next_message(&service))
         .await?
         .expect("expected a command message");
-    assert_eq!(message.topic, CounterContract::command_topic(channel));
+    assert_eq!(message.topic(), CounterContract::command_topic(channel));
     let received_command = CommandPayload::from_json(message.text().unwrap())?;
     assert_eq!(
         received_command.command,
@@ -89,7 +89,7 @@ async fn contract_command_and_event_round_trip() -> hearsay::Result<()> {
     let message = tokio::time::timeout(Duration::from_secs(5), next_message(&operator))
         .await?
         .expect("expected an event message");
-    assert_eq!(message.topic, CounterContract::event_topic(channel));
+    assert_eq!(message.topic(), CounterContract::event_topic(channel));
     let received_event = EventPayload::from_json(message.text().unwrap())?;
     assert_eq!(received_event.event, CounterEvent::Incremented { total: 5 });
     Ok(())

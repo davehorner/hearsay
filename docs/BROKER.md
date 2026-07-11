@@ -14,50 +14,49 @@ The broker stops in two ways, with identical effect: `stop_broker(&broker)` send
 
 ## 2. Connection tasks
 
-`connection_task` owns the read half of a peer's TCP stream and parks the write half in an `Option<PeerWriter>`. It reads length-prefixed postcard `PeerEvent` frames and hands each to `forward_peer_event`, which maps them onto the internal `BrokerEvent` channel:
+`connection_task` owns the read half of a peer's TCP stream and parks the write half in an `Option<PeerWriter>`. It reads length-prefixed frames through a reusable buffer (`FrameReader`), parses each header into byte ranges (`FrameView`, no copies), and hands each frame to `process_incoming_frame`:
 
-- `Hello { id }` takes the parked writer, creates a oneshot shutdown channel, keeps the sender, and forwards `BrokerEvent::Hello { id, writer, shutdown }`. A second `Hello` on the same socket is ignored (the writer was already taken).
-- Every other event forwards as `BrokerEvent::Peer(event)`.
+- A `Hello` frame takes the parked writer, creates a oneshot shutdown channel, forwards `BrokerEvent::Hello` to the event loop, and waits on a second oneshot for the assigned `PeerId`. The task then holds its identity — the `PeerId` and the peer's name as an `Arc<str>` — for the life of the connection. A second `Hello` on the same socket is ignored (the writer was already taken).
+- Every other frame forwards as `BrokerEvent::Frame { peer, name, frame, view }`. Stamping the name on the event (a refcount bump, not an allocation) means frame handling never has to resolve identity from mutable broker state, so a frame racing its own connection's disconnect still carries correct identity. Frames arriving before `Hello` are dropped.
 
 When the read side dies, the task drops its shutdown sender. That resolves the oneshot held by the peer's writer task, which exits and reports the disconnect.
 
-`PeerWriter` is the transport abstraction: `Tcp(OwnedWriteHalf)` or, with the `websockets` feature, `WebSocket(SplitSink<...>)`. `write_to_peer` adds the transport framing: the TCP variant prepends the 4-byte length prefix; the WebSocket variant sends the payload as one binary frame. Everything upstream of the writer deals in unframed postcard bytes.
+`PeerWriter` is the transport enum: `Tcp(OwnedWriteHalf)` or, with the `websockets` feature, `WebSocket(SplitSink<...>)`. Frames already carry their length prefix, so the TCP variant writes them as-is — vectored, in batches — and the WebSocket variant sends each frame as one binary message.
 
 ## 3. The event loop
 
 `broker_loop` owns all broker state as one plain struct, `BrokerState`:
 
-- `peers: HashMap<String, UnboundedSender<Vec<u8>>>` maps peer id to that peer's writer-task channel.
-- `peer_generations` and `generation_counter` implement reconnect-race protection (section 4).
-- `subscriptions: HashMap<String, Vec<String>>` maps topic to subscriber ids. Matching is exact string equality; there are no wildcards.
-- `bridges: Vec<Bridge>`.
+- `peers: Arena<PeerSlot>` holds each peer's name and its two bounded writer channels (control and data), addressed by `PeerId` (slot index plus generation). `peer_names` maps name to `PeerId` for `Hello` replacement.
+- `topic_index: HashMap<Box<str>, u32>` interns topic names to slots in `topics: Vec<Option<TopicState>>`; each topic's subscribers are a `SmallVec<[PeerId; 4]>`. Matching is exact string equality; there are no wildcards. A topic's slot is released to a free list when its last subscriber leaves, so the table cannot accumulate empty entries.
+- `origin_progress` implements cross-broker deduplication (section 6).
+- `bridges: BridgeRegistry`.
 - `disconnect_sender`, cloned into every writer task.
 
-The loop is a `tokio::select!` over four sources: the broker event channel, the disconnect channel, a 2-second bridge-maintenance interval that reconnects any bridge whose connection has died (section 6), and the shutdown watch channel (section 1).
+The loop is a `tokio::select!` over three sources: the broker event channel, the disconnect channel, and the shutdown watch channel (section 1).
 
 ## 4. Peers, generations, and disconnects
 
-`establish_peer` removes any existing peer with the same id, increments the generation counter, records the new generation, creates the peer's message channel, and spawns `connection_writer_task` with the writer, the shutdown receiver, and the `(name, generation)` pair.
+`establish_peer` removes any existing peer with the same name, creates the new peer's control and data channels, inserts it into the arena (which assigns a fresh generation for the slot), and spawns `connection_writer_task` with the writer, the shutdown receiver, and the `PeerId`.
 
-The writer task loops over `select!`: messages from the channel are written to the transport (exiting on write failure or channel close), and the shutdown oneshot resolving means the read side died. Either way the task ends by sending `(name, generation)` on the disconnect channel.
+The writer task drains its channels in batches (control queue first, then data) and writes each batch with one vectored write, so bursts cost one syscall instead of one per frame. It exits on write failure, channel close, or the shutdown oneshot resolving (the read side died). Either way it ends by sending its `PeerId` on the disconnect channel.
 
-`remove_disconnected_peer` only acts if the reported generation matches the current one for that name. This is what makes same-id reconnects safe: when a client reconnects, `establish_peer` bumps the generation and replaces the channel; the old writer task's eventual disconnect report carries the old generation and is ignored, so the new connection's subscriptions survive.
+`remove_disconnected_peer` removes by `PeerId`, and the arena's generation check makes stale reports harmless: when a client reconnects under the same name, the old slot is removed and the new peer occupies a slot under a different generation, so the old writer task's eventual disconnect report matches nothing.
 
 ## 5. Delivery
 
-A `PublishText` event is handled in three steps:
+A publish frame is handled without deserializing or re-serializing the message:
 
-1. `answer_introspection_requests` checks the topic against the `BrokerContract` request topics and publishes the matching report (section 7).
-2. The message is forwarded over every bridge except the one whose id matches the publisher (cycle prevention, section 6), unless the publish was `local_only` (`Route::Local`).
-3. `deliver_to_subscribers` serializes the `Message` once with postcard and sends the bytes to every subscribed peer's writer channel. Peers that are not in the table (already disconnected) are skipped silently.
-
-`PublishBinary` follows the same path with `Message.bytes` populated instead of `Message.payload`.
+1. The kind byte is patched from `Publish` to `Deliver` in place and the frame is frozen into a shared `Bytes` buffer.
+2. For text publishes, `answer_introspection_requests` checks the topic against the `BrokerContract` request topics and publishes the matching report (section 7).
+3. Unless the publish was local-only, a forward header is encoded once and paired with a slice of the same payload buffer, then handed to every bridge except the one matching the publisher (cycle prevention, section 6).
+4. `deliver` hashes the topic once to find its interned id, then walks the subscriber `PeerId` list and clones the shared frame into each peer's queue — a refcount bump per subscriber, no payload copies. Peers no longer in the arena are skipped silently.
 
 `Subscribe` and `Unsubscribe` only mutate the local subscription table. Subscriptions are deliberately not forwarded over bridges: cross-broker delivery is publish-driven (every non-local publish crosses every bridge), so forwarding subscriptions would only cause the remote broker to stream messages into a bridge client that never reads them.
 
 ## 6. Bridges
 
-A `Bridge` (`src/bridge.rs`) is a `Client` connected to the remote broker's address, plus its peer id and the `target_address`. Bridge clients use `autoreconnect: false` and a single connection attempt; the broker loop owns their reconnection.
+A `Bridge` (`src/bridge.rs`) is a `Client` connected to the remote broker's address, plus its peer id and the `target_address`, driven by a dedicated task that forwards frames and reconnects the client on a 2-second interval when its connection dies. Bridge clients use `autoreconnect: false` and a single connection attempt; the bridge task owns their reconnection.
 
 The handshake is symmetric. A client asks its local broker to bridge by sending `OpenBridge { source_address, target_address, ack: false }`:
 
@@ -65,11 +64,11 @@ The handshake is symmetric. A client asks its local broker to bridge by sending 
 2. Because `ack` is false, it then sends `OpenBridge { source_address: target, target_address: source, ack: true }` over the new bridge client, asking the remote broker to create the reverse bridge.
 3. The remote broker creates its reverse bridge with the requesting peer's id as an override id, connects it back, and publishes `BrokerContract::BridgeCreated`.
 
-The override id is the cycle prevention: messages arriving at a broker from a bridge peer carry that peer's id as publisher, and the matching reverse bridge has the same id, so the broker never republishes a message back across the bridge it arrived on.
+The override id is the echo prevention: frames arriving from a bridge peer carry that connection's identity, and the matching reverse bridge has the same id, so the broker never republishes a message back across the bridge it arrived on. Full cycle and duplicate suppression across arbitrary topologies is handled by the forward envelope: each forwarded message carries the set of broker instance ids it has visited (a broker drops anything that already visited it) and a per-origin sequence number checked against a fixed-size reorder window per origin (a ring bitmap over the last 1024 sequences, with least-recently-seen origins evicted beyond 1024 tracked origins), so redundant mesh paths deliver each message at most once in bounded memory.
 
-`CloseBridge { ack: false }` acknowledges removal to the remote side and drops the local bridge; the `ack: true` form is the acknowledgement itself.
+`close_bridge` sends `CloseBridge { ack: false }` with the target address; the broker tears down its bridge and the bridge notifies the remote side with the `ack: true` form, which the remote broker matches to its reverse bridge by the sending connection's identity.
 
-Bridge health is checked on the maintenance tick using read-side liveness (`is_connected`): a bridge counts as dead when its writer is gone or its receiver channel has closed, which happens as soon as the bridge's read task observes the dead socket. Dead bridges are reconnected in place with a single attempt per tick.
+Bridge health is checked by each bridge task on its 2-second tick using read-side liveness (`is_connected`): a bridge counts as dead when its writer is gone or its receiver channel has closed, which happens as soon as the bridge's read task observes the dead socket. Dead bridges are reconnected in place with a single attempt per tick.
 
 ## 7. Introspection topics
 

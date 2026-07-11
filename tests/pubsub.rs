@@ -42,7 +42,7 @@ async fn round_trip() -> hearsay::Result<()> {
     let message = tokio::time::timeout(Duration::from_secs(5), next_message(&subscriber))
         .await?
         .expect("expected a message");
-    assert_eq!(message.topic, topic);
+    assert_eq!(message.topic(), topic);
     let received: TestPayload = serde_json::from_str(message.text().unwrap())?;
     assert_eq!(received, payload);
     Ok(())
@@ -69,7 +69,7 @@ async fn binary_round_trip() -> hearsay::Result<()> {
     let message = tokio::time::timeout(Duration::from_secs(5), next_message(&subscriber))
         .await?
         .expect("expected a message");
-    assert_eq!(message.topic, topic);
+    assert_eq!(message.topic(), topic);
     assert_eq!(message.bytes(), Some(payload.as_slice()));
     Ok(())
 }
@@ -115,7 +115,7 @@ async fn localhost_binds_loopback() -> hearsay::Result<()> {
     let message = tokio::time::timeout(Duration::from_secs(5), next_message(&subscriber))
         .await?
         .expect("expected a message");
-    assert_eq!(message.topic, "test/localhost");
+    assert_eq!(message.topic(), "test/localhost");
     Ok(())
 }
 
@@ -181,6 +181,6 @@ async fn pending_subscriptions_apply_on_connect() -> hearsay::Result<()> {
     let message = tokio::time::timeout(Duration::from_secs(5), next_message(&subscriber))
         .await?
         .expect("expected a message");
-    assert_eq!(message.topic, topic);
+    assert_eq!(message.topic(), topic);
     Ok(())
 }

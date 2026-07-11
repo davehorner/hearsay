@@ -1,46 +1,43 @@
 # Contracts and the Wire Protocol
 
-This document covers the wire protocol (framing and the protocol enums) and the contract pattern applications use to define their own strongly typed messages. Source lives in `src/contract.rs` and `src/wire.rs`.
+This document covers the wire protocol (the hand-rolled frame format) and the contract pattern applications use to define their own strongly typed messages. Source lives in `src/wire.rs` and `src/contract.rs`.
 
 ## 1. Framing
 
-All protocol values are serialized with [postcard](https://docs.rs/postcard). On TCP, each frame is a 4-byte big-endian `u32` length followed by the postcard bytes (`frame_payload` / `read_frame` in `src/wire.rs`). On WebSocket, each binary frame carries the postcard bytes directly with no length prefix, since WebSocket frames are self-delimiting.
+Every frame, on TCP and WebSocket alike, is:
 
-Frames larger than 64 MiB are rejected on both encode and decode, so a corrupt length prefix cannot trigger an unbounded allocation. A rejected frame kills the connection, which the reconnection machinery then handles.
-
-## 2. Protocol enums
-
-Two types cross the wire:
-
-**`PeerEvent`** (client to broker) is public because it is the protocol that non-Rust and WASM clients implement directly:
-
-```rust
-pub enum PeerEvent {
-    Hello { id: String },
-    Subscribe { id: String, topic: String },
-    Unsubscribe { id: String, topic: String },
-    PublishText { id: String, topic: String, payload: String, local_only: bool },
-    PublishBinary { id: String, topic: String, payload: Vec<u8>, local_only: bool },
-    OpenBridge { id: String, source_address: String, target_address: String, ack: bool },
-    CloseBridge { target_address: String, ack: bool },
-}
+```
+[u32 length][u8 kind][kind-specific fields...]
 ```
 
-`Hello` registers the peer for delivery; publishes are routed regardless, but a peer that has not sent `Hello` has no writer registered and receives nothing. `id` is the peer's identity for the subscription table and for bridge cycle prevention.
+All integers are big-endian. `length` counts every byte after the prefix. Strings are `[u16 length][bytes]`, UTF-8. The frame kinds:
 
-**`Message`** (broker to client) is what subscribers receive:
+| Kind | Value | Direction | Fields after the kind byte |
+|---|---|---|---|
+| Hello | 1 | peer to broker | id string |
+| Subscribe | 2 | peer to broker | topic string |
+| Unsubscribe | 3 | peer to broker | topic string |
+| Publish | 4 | peer to broker | `u8` flags, topic string, payload (rest of frame) |
+| Deliver | 5 | broker to peer | `u8` flags, topic string, payload (rest of frame) |
+| Forward | 6 | broker to broker | `u8` flags, `u64` sequence, `u8` hop count, hop count × `u128` broker ids, topic string, payload |
+| OpenBridge | 7 | peer to broker | `u8` ack, source address string, target address string |
+| CloseBridge | 8 | peer to broker | `u8` ack, target address string |
 
-```rust
-pub struct Message {
-    pub topic: String,
-    pub payload: String,        // JSON text publishes
-    pub bytes: Option<Vec<u8>>, // binary publishes
-}
-```
+Flags: bit 0 marks a binary payload (unset means UTF-8 text), bit 1 marks a local-only publish (`Route::Local`).
 
-`Route` (`Global`, `Local`) is a client-side concept; only the `local_only` flag derived from it crosses the wire. See [CLIENT.md](CLIENT.md) section 3.
+Publish and Deliver share a layout deliberately: the broker turns a publish into a delivery by patching the single kind byte in place, so the buffer a publisher encodes is byte-for-byte the buffer every subscriber receives. Delivery fan-out shares that one reference-counted buffer; payload bytes are never copied inside the broker.
 
-Clients that implement the protocol directly (WebSocket and WASM peers) encode `PeerEvent`s and decode `Message`s with postcard themselves: `postcard::to_allocvec(&event)` and `postcard::from_bytes::<Message>(&bytes)`. The protocol types and `read_batch` compile on `wasm32`, so a browser crate depends on hearsay itself for the wire format instead of mirroring it.
+A peer's identity crosses the wire exactly once, in `Hello`; after that the connection is the identity. Frames sent before `Hello` are dropped.
+
+Frames larger than 64 MiB are rejected on both encode and decode, so a corrupt length prefix cannot trigger an unbounded allocation. A malformed or oversized frame kills the connection, which the reconnection machinery then handles.
+
+## 2. Messages
+
+Subscribers receive [`Message`], which is a view over the received `Deliver` frame: `topic()` returns the topic, `text()` the payload for text publishes, and `bytes()` the payload for binary publishes. Cloning a `Message` is cheap (the frame buffer is reference-counted).
+
+`Route` (`Global`, `Local`) is a client-side concept; only the local-only flag derived from it crosses the wire. See [CLIENT.md](CLIENT.md) section 3.
+
+Clients that implement the protocol directly (WebSocket and WASM peers) build frames with the public helpers instead of hand-assembling bytes: `encode_hello`, `encode_subscribe`, `encode_unsubscribe`, `encode_publish_text`, `encode_publish_binary`, and `decode_message`. These helpers, `Message`, and `read_batch` compile on `wasm32`, so a browser crate depends on hearsay itself for the wire format instead of mirroring it.
 
 ## 3. The contract pattern
 
@@ -89,9 +86,9 @@ hearsay::publish(&client, &topic, &payload, hearsay::Route::Global).await?;
 Receive by matching the topic and deserializing the payload struct:
 
 ```rust
-match message.topic.as_str() {
+match message.topic() {
     topic if PingPongContract::command_topic("broadcast") == topic => {
-        if let Ok(payload) = CommandPayload::from_json(&message.payload) {
+        if let Ok(payload) = CommandPayload::from_json(message.text().unwrap_or_default()) {
             // handle payload.command
         }
     }

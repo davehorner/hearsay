@@ -6,14 +6,13 @@ The client connects to a broker, publishes, subscribes, and receives messages. S
 
 ```rust
 pub struct Client {
-    state: Arc<RwLock<ClientState>>,
-    settings: ClientSettings,
+    shared: Arc<ClientShared>,
 }
 ```
 
-`ClientState` holds the peer id, the TCP write half, the receiver slot, the subscription cache, pending subscriptions, the configured read timeout, the broker address, and the reconnection-task flag. The receiver slot is `Arc<Mutex<Option<UnboundedReceiver<Message>>>>`, kept separate from the rest of the state so that waiting for a message never blocks the state lock (see [ARCHITECTURE.md](ARCHITECTURE.md) section 5).
+`ClientShared` holds the peer id (immutable after creation), the settings, the live connection handle in an `ArcSwapOption<Connection>` (loaded atomically on every publish, no lock), the receiver slot (`Mutex<Option<Receiver<Message>>>`), and a cold-state mutex guarding the subscription caches, the broker address, and the reconnection-task flag. Waiting for a message locks only the receiver slot, and publishing locks nothing (see [ARCHITECTURE.md](ARCHITECTURE.md) section 5).
 
-`create_client(name, settings)` assigns the peer id as `{name}_{uuid_v4}`, so multiple instances of the same program get distinct identities on the broker. `assign_client_id` overrides the id (the broker uses this for bridge cycle prevention).
+`create_client(name, settings)` assigns the peer id as `{name}_{uuid_v4}`, so multiple instances of the same program get distinct identities on the broker. `client_id` returns it. The broker overrides the id at creation for bridge clients (bridge echo prevention).
 
 `ClientSettings`:
 
@@ -24,34 +23,35 @@ pub struct Client {
 
 ## 2. Connecting and reconnecting
 
-`connect(&mut client, address)` records the address in state, runs `establish_connection`, and (if `autoreconnect` is set and no task exists yet) spawns the reconnection task. Exactly one reconnection task ever exists per client, and it holds only a `Weak` reference to the state, so it exits when the `Client` is dropped.
+`connect(&client, address)` records the address in state, runs `establish_connection`, and (if `autoreconnect` is set and no task exists yet) spawns the reconnection task. Exactly one reconnection task ever exists per client, and it holds only a `Weak` reference to the state, so it exits when the `Client` is dropped.
 
 `establish_connection`:
 
 1. `connect_with_retries` dials the address using standard host resolution, attempting IPv4 addresses first to match the broker's bind preference (so `localhost` reaches a broker that bound `127.0.0.1` even when the resolver lists `::1` first, or when a firewall black-holes one family). TCP keepalive (1s probe, 1s interval) is configured on the stream.
-2. The stream is split. Under the state lock: the write half is installed, the read task is spawned, `PeerEvent::Hello { id }` is sent, and `resubscribe` replays the union of cached and pending subscriptions (a pending topic is only removed from the pending set after its subscribe frame is written successfully, so partial failures cannot lose topics).
-3. After the state lock is released, the new receiver is installed into the receiver slot. Messages the read task produced in the meantime are buffered in the channel, so nothing is lost to the ordering.
+2. The stream is split, the reader and writer tasks are spawned, the new receiver is installed into the receiver slot, and the new connection handle is swapped in atomically. `Hello` is sent and `resubscribe` replays the union of cached and pending subscriptions (a pending topic is only removed from the pending set after its subscribe frame is sent successfully, so partial failures cannot lose topics).
 
-The reconnection task ticks every 2 seconds; when the client is disconnected and an address is known, it re-runs `establish_connection`. Reconnecting to a different address is just calling `connect` again: the recorded address changes and the existing task follows it.
+The reconnection task starts at a 2-second interval with exponential backoff (capped at 30 seconds); when the client is disconnected and an address is known, it re-runs `establish_connection`. Reconnecting to a different address is just calling `connect` again: the recorded address changes and the existing task follows it.
 
-Disconnection is detected in two places: `notify_broker` clears the writer when a TCP write fails (so publish-only clients and bridges notice promptly), and `next_message`/`try_next_message` clear the writer and receiver when the receive channel closes (the read task exited because the socket died).
+Disconnection is detected in two places: the reconnection task observes a closed outbound channel when the writer task dies (so publish-only clients and bridges notice promptly), and `next_message`/`try_next_message` clear the receiver and connection handle when the receive channel closes (the read task exited because the socket died).
 
 ## 3. Publishing
 
-- `publish(client, topic, payload, route)` serializes any `impl Serialize` to JSON and delegates to `publish_json`.
-- `publish_json(client, topic, payload, route)` sends `PeerEvent::PublishText` with the JSON string.
-- `publish_bytes(client, topic, payload, route)` sends `PeerEvent::PublishBinary` with raw bytes; subscribers receive it in `Message.bytes`.
+- `publish(client, topic, payload, route)` serializes any `impl Serialize` as JSON directly into the frame buffer.
+- `publish_json(client, topic, payload, route)` sends an existing JSON string as a text publish.
+- `publish_bytes(client, topic, payload, route)` sends a binary publish; subscribers receive it through `Message::bytes()`.
+
+Each publish builds the complete wire frame in one buffer — length prefix, header, and payload serialized in place — and sends it to the writer task. There are no intermediate strings, no re-serialization, and no lock: the connection handle is an atomic load.
 
 The `Route` controls the scope of the publish:
 
 - `Route::Global` (default): delivered to local subscribers and forwarded across bridges.
-- `Route::Local`: delivered to local subscribers only; sets `local_only` on the wire so the broker skips bridges.
+- `Route::Local`: delivered to local subscribers only; sets the local-only flag on the wire so the broker skips bridges.
 
-All three functions take `&Client`; mutation happens behind the state lock. A write failure clears the writer and surfaces as an error.
+A send failure (the writer task died) surfaces as `Error::NotConnected`.
 
 ## 4. Subscriptions
 
-`subscribe(client, topics)` sends `PeerEvent::Subscribe` per topic and caches it. While disconnected, topics go to the pending set instead and are applied on the next successful connect. If a subscribe write fails mid-call, the topic is moved to pending and the error is returned, so the subscription still applies after reconnect.
+`subscribe(client, topics)` sends a subscribe frame per topic and caches it. While disconnected, topics go to the pending set instead and are applied on the next successful connect. If a subscribe send fails mid-call, the topic is moved to pending and the error is returned, so the subscription still applies after reconnect.
 
 `unsubscribe(client, topics)` removes the topic from both the pending set and the cache and notifies the broker when connected, so an offline unsubscribe does not resurrect on reconnect.
 
@@ -59,11 +59,11 @@ All three functions take `&Client`; mutation happens behind the state lock. A wr
 
 ## 5. Receiving
 
-- `next_message(&mut client)` awaits the receive channel. `None` means the connection is gone (and the writer/receiver have been cleared so reconnection can proceed). The await holds only the receiver-slot mutex and is cancel-safe, so wrapping it in `tokio::time::timeout` (as `run_lifecycle` does) cannot lose messages or the receiver.
-- `try_next_message(&mut client)` is the non-blocking variant using `try_recv`.
+- `next_message(&client)` awaits the receive channel. `None` means the connection is gone (and the receiver and connection handle have been cleared so reconnection can proceed). The await holds only the receiver-slot mutex and is cancel-safe, so wrapping it in `tokio::time::timeout` (as `run_lifecycle` does) cannot lose messages or the receiver.
+- `try_next_message(&client)` is the non-blocking variant using `try_recv`.
 
-There is no message filtering in the client: every message for every subscribed topic comes through the same stream, and receivers match on `message.topic` (see [CONTRACTS.md](CONTRACTS.md) for the idiomatic pattern).
+There is no message filtering in the client: every message for every subscribed topic comes through the same stream, and receivers match on `message.topic()` (see [CONTRACTS.md](CONTRACTS.md) for the idiomatic pattern).
 
 ## 6. Bridge requests
 
-`open_bridge(client, source_address, target_address, ack)` and `close_bridge(client, target_address, ack)` send the corresponding `PeerEvent`s. Applications use the `ack: false` forms; the `ack: true` forms are the broker-to-broker acknowledgement halves of the handshake described in [BROKER.md](BROKER.md) section 6.
+`open_bridge(client, source_address, target_address)` and `close_bridge(client, target_address)` send the corresponding bridge frames. The acknowledged forms are internal, broker-to-broker halves of the handshake described in [BROKER.md](BROKER.md) section 6.

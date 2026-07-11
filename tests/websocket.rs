@@ -2,7 +2,8 @@
 
 use futures_util::{SinkExt, StreamExt};
 use hearsay::{
-    ClientSettings, PeerEvent, Route, connect, create_client, next_message, publish, start_broker,
+    Bytes, ClientSettings, Route, connect, create_client, decode_message, encode_hello,
+    encode_publish_text, encode_subscribe, next_message, publish, start_broker,
     start_websocket_listener, subscribe,
 };
 use serde::{Deserialize, Serialize};
@@ -18,11 +19,8 @@ struct TestPayload {
 
 type WebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-async fn send_event(websocket: &mut WebSocket, event: &PeerEvent) -> hearsay::Result<()> {
-    let bytes = postcard::to_allocvec(event)?;
-    websocket
-        .send(tungstenite::Message::Binary(bytes.into()))
-        .await?;
+async fn send_frame(websocket: &mut WebSocket, frame: Bytes) -> hearsay::Result<()> {
+    websocket.send(tungstenite::Message::Binary(frame)).await?;
     Ok(())
 }
 
@@ -45,43 +43,24 @@ async fn websocket_and_tcp_peers_interoperate() -> hearsay::Result<()> {
 
     let (mut websocket, _response) =
         tokio_tungstenite::connect_async(format!("ws://{websocket_address}")).await?;
-    let websocket_id = "websocket_peer".to_string();
-    send_event(
-        &mut websocket,
-        &PeerEvent::Hello {
-            id: websocket_id.clone(),
-        },
-    )
-    .await?;
-    send_event(
-        &mut websocket,
-        &PeerEvent::Subscribe {
-            id: websocket_id.clone(),
-            topic: "from/tcp".to_string(),
-        },
-    )
-    .await?;
+    send_frame(&mut websocket, encode_hello("websocket_peer")?).await?;
+    send_frame(&mut websocket, encode_subscribe("from/tcp")?).await?;
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     let payload = TestPayload {
         name: "Matthew".to_string(),
         age: 30,
     };
-    send_event(
+    send_frame(
         &mut websocket,
-        &PeerEvent::PublishText {
-            id: websocket_id.clone(),
-            topic: "from/websocket".to_string(),
-            payload: serde_json::to_string(&payload)?,
-            local_only: false,
-        },
+        encode_publish_text("from/websocket", &serde_json::to_string(&payload)?, false)?,
     )
     .await?;
 
     let message = tokio::time::timeout(Duration::from_secs(5), next_message(&tcp_client))
         .await?
         .expect("expected a message from the websocket peer");
-    assert_eq!(message.topic, "from/websocket");
+    assert_eq!(message.topic(), "from/websocket");
     let received: TestPayload = serde_json::from_str(message.text().unwrap())?;
     assert_eq!(received, payload);
 
@@ -95,13 +74,12 @@ async fn websocket_and_tcp_peers_interoperate() -> hearsay::Result<()> {
                 .expect("websocket closed unexpectedly")
                 .expect("websocket read failed");
             if let tungstenite::Message::Binary(data) = frame {
-                return postcard::from_bytes::<hearsay::Message>(&data)
-                    .expect("failed to decode broker message");
+                return decode_message(data).expect("failed to decode broker message");
             }
         }
     })
     .await?;
-    assert_eq!(message.topic, "from/tcp");
+    assert_eq!(message.topic(), "from/tcp");
     let received: TestPayload = serde_json::from_str(message.text().unwrap())?;
     assert_eq!(received, payload);
     Ok(())

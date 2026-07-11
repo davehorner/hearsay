@@ -22,12 +22,12 @@ All three methods have default no-op bodies (`std::future::ready`), so implement
 struct Responder;
 
 impl Lifecycle for Responder {
-    async fn initialize(&mut self, client: &mut Client) {
+    async fn initialize(&mut self, client: &Client) {
         let _ = subscribe(client, &[&MyContract::command_topic("all")]).await;
     }
 
-    async fn receive_message(&mut self, message: &Message, client: &mut Client) -> Option<Interrupt> {
-        // match message.topic, deserialize, publish responses
+    async fn receive_message(&mut self, message: &Message, client: &Client) -> Option<Interrupt> {
+        // match message.topic(), deserialize, publish responses
         None
     }
 }

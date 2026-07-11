@@ -10,9 +10,10 @@ hearsay lets Rust programs talk to each other. One process hosts a broker; any n
 
 ## 2. Module layout
 
-- `src/lib.rs` declares the modules, re-exports the public surface, and defines `Error` (a boxed error) and `Result`.
-- `src/contract.rs` holds all protocol data types: `Message`, `Route`, `PeerEvent`, and the `BrokerContract` introspection contract. Types only, no behavior.
-- `src/wire.rs` holds the framing functions: postcard serialization with a 64 MiB cap, and the 4-byte big-endian length prefix used on TCP.
+- `src/lib.rs` declares the modules, re-exports the public surface, and defines the typed `Error` enum and `Result`.
+- `src/contract.rs` holds `Route` and the `BrokerContract` introspection contract.
+- `src/wire.rs` is the wire protocol: the hand-rolled frame layout (4-byte big-endian length prefix, kind byte, flags, topic, payload) with a 64 MiB cap, the public `encode_*`/`decode_message` helpers, the `Bytes`-backed `Message`, and the transport half (the amortized `FrameReader` and the vectored batched frame writer).
+- `src/arena.rs` is a generational arena: peers are addressed by `PeerId` (index plus generation), so stale references from dead connections can never touch a newer peer in the same slot.
 - `src/client.rs` is the client: connection management, reconnection, subscriptions, publishing, and message receipt.
 - `src/batch.rs` is the batching primitive: size- and interval-triggered coalescing of high-frequency items into single binary messages.
 - `src/broker.rs` is the broker: the listener, the per-connection tasks, the single-owner event loop, peer and subscription state, and bridge management.
@@ -23,13 +24,15 @@ hearsay lets Rust programs talk to each other. One process hosts a broker; any n
 
 The dependency direction is strictly upward: `wire` and `contract` at the bottom; `client` and `batch` built on those; `bridge` reusing `client`; `broker` on top of all of them; `lifecycle` and `spawn` depending only on `client` and `broker` respectively. There are no cycles.
 
-On `wasm32` targets the crate compiles down to its protocol surface: `Message`, `Route`, `PeerEvent`, `BrokerContract` and its payloads, and `read_batch`. Everything tokio-backed (broker, client, bridge, lifecycle, spawn, websocket listener, wire framing, the sending half of batching) is compiled out, and tokio, socket2, and uuid are target-gated dependencies that never appear in a wasm build. This is what lets a browser client depend on hearsay for the exact wire types instead of mirroring them; see [WEBSOCKETS.md](WEBSOCKETS.md) section 4. CI checks the wasm32 build on every push.
+On `wasm32` targets the crate compiles down to its protocol surface: `Message`, `Route`, `BrokerContract` and its payloads, `read_batch`, and the frame helpers (`encode_hello`, `encode_subscribe`, `encode_unsubscribe`, `encode_publish_text`, `encode_publish_binary`, `decode_message`). Everything tokio-backed (broker, client, bridge, lifecycle, spawn, websocket listener, the transport half of wire, the sending half of batching) is compiled out, and tokio, socket2, and uuid are target-gated dependencies that never appear in a wasm build. This is what lets a browser client depend on hearsay for the exact wire format instead of mirroring it; see [WEBSOCKETS.md](WEBSOCKETS.md) section 4. CI checks the wasm32 build on every push.
 
 ## 3. Design principles
 
-**Data-oriented, no object orientation.** State lives in plain structs (`Broker`, `Client`, `ClientSettings`, `BrokerState`, `ClientState`, `Bridge`, `Spawner`). Every operation is a free function taking the struct it operates on: `connect(&mut client, address)`, `publish(&client, topic, payload, route)`, `spawn_app(&broker, app)`. There are no inherent methods, no client trait hierarchy, and the only trait in the crate is `Lifecycle`, which exists because user code must be invoked by the runner.
+**Data-oriented, no object orientation.** State lives in plain structs (`Broker`, `Client`, `ClientSettings`, `BrokerState`, `Bridge`, `Spawner`). Every operation is a free function taking the struct it operates on: `connect(&client, address)`, `publish(&client, topic, payload, route)`, `spawn_app(&broker, app)`. There are no inherent methods beyond `Message` accessors, no client trait hierarchy, and the only trait in the crate is `Lifecycle`, which exists because user code must be invoked by the runner.
 
-**Private by default.** Internal types (`BrokerEvent`, `PeerWriter`, `ClientState`, `SpawnerState`, `Bridge`) are module-private or `pub(crate)`. The public surface is the set of free functions plus the protocol data types. `PeerEvent` is public because it is the wire protocol that non-Rust and WASM clients must speak.
+**One buffer per message.** The wire format is designed around the broker's job (routing), so the frame a publisher encodes is the frame subscribers receive: the broker parses the header in place, patches one kind byte, and fans the same reference-counted `Bytes` buffer out to every subscriber and bridge. Payload bytes are copied exactly zero times between the publisher's encoder and each socket write, and fan-out costs one refcount bump per subscriber. Broker state is arena-and-integer keyed (`PeerId`, interned topic ids) rather than string keyed, so the delivery loop is one topic hash followed by contiguous integer iteration.
+
+**Private by default.** Internal types (`BrokerEvent`, `PeerWriter`, `FrameView`, `SpawnerState`, `Bridge`) are module-private or `pub(crate)`. The public surface is the set of free functions plus the protocol data types. The `encode_*`/`decode_message` frame helpers are public because they are the wire protocol that non-Rust and WASM clients must speak.
 
 **Single-owner state for the broker.** All broker state is plain locals owned by one event-loop task (`broker_loop`). Connection tasks communicate with it over an unbounded channel. There is no shared-state locking in the broker at all.
 
@@ -48,10 +51,10 @@ Every background task is tied to the value that owns its state, so dropping the 
 
 ## 5. Locking discipline
 
-The broker has no locks. The client has exactly two, and they are never held at the same time:
+The broker has no locks. The client's publish path has none either: the peer id is immutable after creation, and the live connection handle sits in an `ArcSwapOption<Connection>`, so a publish is an atomic load, one frame encode, and a channel send. The client's two locks guard only the cold paths, and they are never held at the same time:
 
-- `Client.state: Arc<RwLock<ClientState>>` guards identity, the writer half, subscriptions, and reconnection bookkeeping. It is held only across short critical sections (including the actual TCP write).
-- The receiver lives in its own slot, `ClientState.receiver: Arc<Mutex<Option<UnboundedReceiver<Message>>>>`. `next_message` takes the state lock briefly (to clone the slot handle), releases it, and only then locks the receiver slot for the potentially long `recv().await`. Reconnection installs a new receiver through the same slot, also without holding the state lock.
+- `ClientShared.cold: Mutex<ColdState>` guards the subscription caches, the broker address, and the reconnection-task flag. It is touched by `subscribe`/`unsubscribe`, `connect`, and the reconnection task, never by publishing.
+- The receiver lives in its own slot, `ClientShared.receiver: Mutex<Option<Receiver<Message>>>`. `next_message` locks it for the potentially long `recv().await`; reconnection installs a new receiver through the same slot.
 
 Because every code path acquires at most one of the two locks at a time, lock-order deadlocks are impossible by construction. Holding the receiver mutex across `recv().await` is intentional and cancel-safe: if the caller's timeout cancels the future, the guard drops and the receiver stays in the slot.
 
@@ -64,4 +67,4 @@ Both are additive: the default build is the TCP broker, client, contracts, and l
 
 ## 7. Errors
 
-`hearsay::Error` is `Box<dyn std::error::Error + Send + Sync>` and `hearsay::Result<T>` wraps it. Functions that can fail return `Result`; functions that report state (`is_connected`, `app_status`, `next_message`) return the state directly. Inside the broker loop, per-event errors are swallowed so one malformed event cannot stop the bus.
+`hearsay::Error` is a typed enum (`NotConnected`, `FrameTooLarge`, `TopicTooLong`, `Transport`, and so on) and `hearsay::Result<T>` wraps it. Functions that can fail return `Result`; functions that report state (`is_connected`, `app_status`, `next_message`) return the state directly. Inside the broker loop, per-event errors are swallowed so one malformed event cannot stop the bus.

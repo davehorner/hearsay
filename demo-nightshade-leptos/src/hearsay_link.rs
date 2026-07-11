@@ -1,7 +1,8 @@
 //! The page's hearsay peer: a WebSocket session against the broker's
 //! websocket listener, speaking the hearsay wire format directly. Each
-//! client-to-broker frame is one postcard-encoded `PeerEvent`, each
-//! broker-to-client frame one postcard-encoded `hearsay::Message`.
+//! frame in both directions is one length-prefixed hearsay frame, encoded
+//! and decoded with the `hearsay::encode_*` / `hearsay::decode_message`
+//! helpers.
 
 use leptos::prelude::*;
 use wasm_bindgen::JsCast;
@@ -46,12 +47,7 @@ pub fn connect(state: DemoState, slot: HearsaySlot, bridge: BridgeSlot) {
     let open_id = client_id.clone();
     let onopen = Closure::<dyn FnMut()>::new(move || {
         state.hearsay_connected.set(true);
-        send_event(
-            &open_socket,
-            &hearsay::PeerEvent::Hello {
-                id: open_id.clone(),
-            },
-        );
+        send_frame(&open_socket, hearsay::encode_hello(&open_id));
         let mut topics = vec![
             TEXT_TOPIC.to_string(),
             BINARY_TOPIC.to_string(),
@@ -59,13 +55,7 @@ pub fn connect(state: DemoState, slot: HearsaySlot, bridge: BridgeSlot) {
         ];
         topics.extend(shell::shell_topics(state));
         for topic in topics {
-            send_event(
-                &open_socket,
-                &hearsay::PeerEvent::Subscribe {
-                    id: open_id.clone(),
-                    topic,
-                },
-            );
+            send_frame(&open_socket, hearsay::encode_subscribe(&topic));
         }
         shell::on_connected(state, slot);
     });
@@ -77,7 +67,7 @@ pub fn connect(state: DemoState, slot: HearsaySlot, bridge: BridgeSlot) {
             return;
         };
         let bytes = js_sys::Uint8Array::new(&buffer).to_vec();
-        let Ok(message) = postcard::from_bytes::<hearsay::Message>(&bytes) else {
+        let Some(message) = hearsay::decode_message(hearsay::Bytes::from(bytes)) else {
             return;
         };
         if !shell::handle_shell_topic(state, slot, &message) {
@@ -105,11 +95,11 @@ fn schedule_reconnect(state: DemoState, slot: HearsaySlot, bridge: BridgeSlot) {
     );
 }
 
-fn send_event(socket: &WebSocket, event: &hearsay::PeerEvent) {
+fn send_frame(socket: &WebSocket, frame: hearsay::Result<hearsay::Bytes>) {
     if socket.ready_state() != WebSocket::OPEN {
         return;
     }
-    if let Ok(frame) = postcard::to_allocvec(event) {
+    if let Ok(frame) = frame {
         let _ = socket.send_with_u8_array(&frame);
     }
 }
@@ -124,28 +114,18 @@ fn with_link(slot: HearsaySlot, body: impl FnOnce(&HearsayLink)) {
 
 pub fn publish_text(slot: HearsaySlot, topic: &str, payload: &str) {
     with_link(slot, |link| {
-        send_event(
+        send_frame(
             &link.socket,
-            &hearsay::PeerEvent::PublishText {
-                id: link.client_id.clone(),
-                topic: topic.to_string(),
-                payload: payload.to_string(),
-                local_only: false,
-            },
+            hearsay::encode_publish_text(topic, payload, false),
         );
     });
 }
 
 pub fn publish_binary(slot: HearsaySlot, topic: &str, payload: Vec<u8>) {
     with_link(slot, |link| {
-        send_event(
+        send_frame(
             &link.socket,
-            &hearsay::PeerEvent::PublishBinary {
-                id: link.client_id.clone(),
-                topic: topic.to_string(),
-                payload,
-                local_only: false,
-            },
+            hearsay::encode_publish_binary(topic, &payload, false),
         );
     });
 }

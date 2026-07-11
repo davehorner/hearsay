@@ -68,7 +68,7 @@ let broker = hearsay::start_broker("127.0.0.1:9612").await?;
 hearsay::start_websocket_listener(&broker, "127.0.0.1:9613").await?;
 ```
 
-WebSocket peers speak the same wire protocol as TCP peers and share the broker's subscription table. On `wasm32` targets the crate compiles down to the protocol types (`PeerEvent`, `Message`), so a browser client depends on hearsay itself for the wire format and encodes them with [postcard](https://docs.rs/postcard) directly.
+WebSocket peers speak the same wire protocol as TCP peers and share the broker's subscription table. On `wasm32` targets the crate compiles down to the protocol surface (`Message`, the `encode_hello`/`encode_subscribe`/`encode_publish_text`/`encode_publish_binary` frame builders, and `decode_message`), so a browser client depends on hearsay itself for the wire format instead of mirroring it.
 
 ## Spawn
 
