@@ -41,6 +41,11 @@ async fn websocket_accept_loop(
 }
 
 async fn websocket_connection_task(event_sender: Sender<BrokerEvent>, stream: TcpStream) {
+    if let Ok(address) = stream.peer_addr()
+        && !address.ip().is_loopback()
+    {
+        let _ = stream.set_nodelay(true);
+    }
     let Ok(websocket) = tokio_tungstenite::accept_async(stream).await else {
         return;
     };

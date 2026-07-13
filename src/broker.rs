@@ -232,7 +232,10 @@ async fn accept_loop(
     loop {
         tokio::select! {
             accepted = listener.accept() => match accepted {
-                Ok((stream, _address)) => {
+                Ok((stream, address)) => {
+                    if !address.ip().is_loopback() {
+                        let _ = stream.set_nodelay(true);
+                    }
                     tokio::spawn(connection_task(event_sender.clone(), stream));
                 }
                 Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,

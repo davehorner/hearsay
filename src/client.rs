@@ -392,7 +392,7 @@ async fn create_tcp_connection(address: &str) -> Result<TcpStream> {
     for socket_address in addresses {
         match TcpStream::connect(socket_address).await {
             Ok(stream) => {
-                configure_keepalive(&stream)?;
+                configure_stream(&stream)?;
                 return Ok(stream);
             }
             Err(error) => last_error = error.into(),
@@ -401,7 +401,10 @@ async fn create_tcp_connection(address: &str) -> Result<TcpStream> {
     Err(last_error)
 }
 
-fn configure_keepalive(stream: &TcpStream) -> Result<()> {
+fn configure_stream(stream: &TcpStream) -> Result<()> {
+    if !stream.peer_addr()?.ip().is_loopback() {
+        stream.set_nodelay(true)?;
+    }
     let socket_reference = socket2::SockRef::from(stream);
     let keepalive = TcpKeepalive::new()
         .with_time(Duration::from_secs(1))
