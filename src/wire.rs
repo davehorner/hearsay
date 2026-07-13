@@ -193,6 +193,7 @@ mod transport {
     const KIND_CLOSE_BRIDGE: u8 = 8;
 
     const READ_CHUNK: usize = 64 * 1024;
+    const MINIMUM_READ_SPARE: usize = 4 * 1024;
     pub(crate) const MAX_WRITE_BATCH: usize = 64;
     pub(crate) const DELIVER_PAYLOAD_OFFSET: usize = HEADER_LENGTH;
 
@@ -490,7 +491,7 @@ mod transport {
                         return Ok(self.buffer.split_to(total));
                     }
                     self.buffer.reserve(total - self.buffer.len());
-                } else {
+                } else if self.buffer.capacity() - self.buffer.len() < MINIMUM_READ_SPARE {
                     self.buffer.reserve(READ_CHUNK);
                 }
                 if self.reader.read_buf(&mut self.buffer).await? == 0 {

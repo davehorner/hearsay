@@ -4,7 +4,7 @@ Batching is a core primitive (no feature gate) for high-frequency traffic: it co
 
 ## 1. Why it exists
 
-The cost of a message is dominated by fixed overhead, not payload size: framing, the syscall, the broker's event-loop dispatch, per-subscriber fan-out, and channel wakeups. The benchmarks put a full publish-to-receive round trip at roughly 24µs and the publish path alone at roughly 4µs, nearly independent of payload size. Sending a thousand per-frame updates individually pays that fixed cost a thousand times, and each subscriber receives a thousand deliveries. One batch pays it once, and each subscriber receives one delivery.
+The cost of a message is dominated by fixed overhead, not payload size: framing, the syscall, the broker's event-loop dispatch, per-subscriber fan-out, and channel wakeups. The benchmarks put a full publish-to-receive round trip at roughly 30µs and the publish path alone at roughly 0.4µs, nearly independent of payload size. Sending a thousand per-frame updates individually pays that fixed cost a thousand times, and each subscriber receives a thousand deliveries. One batch pays it once, and each subscriber receives one delivery.
 
 The practical pattern is two traffic classes: interactive events (small, latency-sensitive) go immediately as ordinary contract messages; bulk state (entity transforms, telemetry, output streams) goes through a `Batch`.
 
