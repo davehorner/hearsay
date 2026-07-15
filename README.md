@@ -53,9 +53,10 @@ The bus runs for as long as the `Broker` is held; `stop_broker` (or dropping it)
 | Feature | Adds |
 |---------|------|
 | `websockets` | The broker accepts WebSocket peers, so browser and WASM apps participate directly |
+| `udp` | The broker accepts UDP peers for unreliable, latency-sensitive traffic, sharing one subscription table with TCP and WebSocket peers |
 | `spawn` | The broker owns, supervises, and restarts client app processes |
 
-Both are additive; the default build is the TCP broker, client, contracts, batching, and lifecycle runner.
+All are additive; the default build is the TCP broker, client, contracts, batching, and lifecycle runner.
 
 ## WebSockets
 
@@ -69,6 +70,19 @@ hearsay::start_websocket_listener(&broker, "127.0.0.1:9613").await?;
 ```
 
 WebSocket peers speak the same wire protocol as TCP peers and share the broker's subscription table. On `wasm32` targets the crate compiles down to the protocol surface (`Message`, the `encode_hello`/`encode_subscribe`/`encode_publish_text`/`encode_publish_binary` frame builders, and `decode_message`), so a browser client depends on hearsay itself for the wire format instead of mirroring it.
+
+## UDP
+
+```toml
+hearsay = { version = "0.1", features = ["udp"] }
+```
+
+```rust
+let broker = hearsay::start_broker("127.0.0.1:9612").await?;
+hearsay::start_udp_listener(&broker, "127.0.0.1:9613").await?;
+```
+
+UDP peers share the broker's subscription table with TCP and WebSocket peers, but their traffic is unreliable and unordered (one frame per datagram, best-effort) — the right fit for latency-sensitive state where the freshest message matters more than every message. This is the transport substrate real-time networking builds on; see [docs/NETWORKING.md](docs/NETWORKING.md) for the transport model, delivery classes, and the authentication and timing primitives.
 
 ## Spawn
 
@@ -143,7 +157,7 @@ just run-demo
 
 ## Documentation
 
-Architecture documentation lives in [docs/](docs/ARCHITECTURE.md), covering the broker, client, wire protocol and contracts, batching, lifecycles, process spawning, and WebSockets.
+Architecture documentation lives in [docs/](docs/ARCHITECTURE.md), covering the broker, client, wire protocol and contracts, batching, lifecycles, process spawning, WebSockets, and [networking](docs/NETWORKING.md).
 
 ## License
 

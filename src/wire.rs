@@ -213,7 +213,7 @@ mod transport {
             }
         }
 
-        #[cfg(feature = "websockets")]
+        #[cfg(any(feature = "websockets", feature = "udp"))]
         pub(crate) fn to_contiguous(&self) -> Bytes {
             if self.payload.is_empty() {
                 return self.header.clone();

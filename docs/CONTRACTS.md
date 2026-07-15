@@ -4,7 +4,7 @@ This document covers the wire protocol (the hand-rolled frame format) and the co
 
 ## 1. Framing
 
-Every frame, on TCP and WebSocket alike, is:
+Every frame — on TCP, WebSocket, and UDP alike — is:
 
 ```
 [u32 length][u8 kind][kind-specific fields...]

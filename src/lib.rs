@@ -14,6 +14,8 @@ mod contract;
 mod lifecycle;
 #[cfg(all(feature = "spawn", not(target_arch = "wasm32")))]
 mod spawn;
+#[cfg(all(feature = "udp", not(target_arch = "wasm32")))]
+mod udp;
 #[cfg(all(feature = "websockets", not(target_arch = "wasm32")))]
 mod websocket;
 mod wire;
@@ -35,6 +37,9 @@ pub use self::{broker::*, client::*, lifecycle::*};
 
 #[cfg(all(feature = "spawn", not(target_arch = "wasm32")))]
 pub use self::spawn::*;
+
+#[cfg(all(feature = "udp", not(target_arch = "wasm32")))]
+pub use self::udp::*;
 
 #[cfg(all(feature = "websockets", not(target_arch = "wasm32")))]
 pub use self::websocket::*;

@@ -39,6 +39,11 @@ pub struct Broker {
 
 pub(crate) enum PeerWriter {
     Tcp(OwnedWriteHalf),
+    #[cfg(feature = "udp")]
+    Udp {
+        socket: Arc<tokio::net::UdpSocket>,
+        address: SocketAddr,
+    },
     #[cfg(feature = "websockets")]
     WebSocket(
         futures_util::stream::SplitSink<
@@ -52,6 +57,16 @@ impl PeerWriter {
     async fn send_frames(&mut self, frames: &[Frame]) -> Result<()> {
         match self {
             PeerWriter::Tcp(writer) => write_frames(writer, frames).await,
+            #[cfg(feature = "udp")]
+            PeerWriter::Udp { socket, address } => {
+                for frame in frames {
+                    let datagram = frame.to_contiguous();
+                    if datagram.len() <= crate::udp::MAX_DATAGRAM_PAYLOAD {
+                        let _ = socket.send_to(&datagram, *address).await;
+                    }
+                }
+                Ok(())
+            }
             #[cfg(feature = "websockets")]
             PeerWriter::WebSocket(sink) => {
                 use futures_util::SinkExt;

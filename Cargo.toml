@@ -19,6 +19,7 @@ all-features = true
 
 [features]
 spawn = ["tokio/process"]
+udp = []
 websockets = ["dep:tokio-tungstenite", "dep:futures-util"]
 
 [dependencies]
