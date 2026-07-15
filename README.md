@@ -54,6 +54,8 @@ The bus runs for as long as the `Broker` is held; `stop_broker` (or dropping it)
 |---------|------|
 | `websockets` | The broker accepts WebSocket peers, so browser and WASM apps participate directly |
 | `udp` | The broker accepts UDP peers with per-message delivery guarantees (unreliable or reliable-ordered) for latency-sensitive traffic, sharing one subscription table with TCP and WebSocket peers |
+| `secure` | UDP datagrams are encrypted with a shared passphrase, so only peers holding it can join, read, or publish |
+| `nat` | Experimental UDP hole-punching rendezvous for direct peer-to-peer between hosts behind NAT |
 | `spawn` | The broker owns, supervises, and restarts client app processes |
 
 All are additive; the default build is the TCP broker, client, contracts, batching, and lifecycle runner.
@@ -158,6 +160,12 @@ The [demo/](demo) directory is a complete multi-process application built on hea
 
 ```
 just run-demo
+```
+
+[demo-cubelink/](demo-cubelink) is a two-player game on the nightshade engine that networks over the UDP transport: each player drives a cube around a floor with a pan-orbit view and they chat over a retained-UI panel, positions sent unreliably and chat sent reliably.
+
+```
+just run-cubelink
 ```
 
 ## Documentation

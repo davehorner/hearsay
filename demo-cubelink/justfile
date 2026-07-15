@@ -1,0 +1,30 @@
+set windows-shell := ["powershell.exe"]
+
+# Lists the available recipes
+@default:
+    just --list
+
+# Builds the game binary
+build:
+    cargo build
+
+# Launches BOTH players on this computer, each in its own window, from one
+# command. This is the simplest way to try it: no second terminal, no timing.
+play: build
+    Start-Process -FilePath ".\target\debug\cubelink.exe"
+    Start-Process -FilePath ".\target\debug\cubelink.exe" -ArgumentList "join"
+
+# Runs just the host (blue cube) in this terminal. Launches the compiled binary
+# directly, so a guest started elsewhere is never blocked on the cargo lock.
+host: build
+    .\target\debug\cubelink.exe
+
+# Runs just a guest (orange cube). Omit the address to join a host on this same
+# computer, or pass the host's IP for LAN play: `just join 192.168.1.42`.
+join host="127.0.0.1": build
+    .\target\debug\cubelink.exe join {{host}}
+
+# Formats and lints
+check:
+    cargo fmt --all
+    cargo clippy --all-targets -- -D warnings

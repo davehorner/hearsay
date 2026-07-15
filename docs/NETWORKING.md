@@ -59,13 +59,23 @@ Every UDP publish chooses a [`Delivery`], and control frames are always reliable
 
 Reliability is layered on the datagram core with per-packet sequence numbers, acknowledgement bitfields, retransmission timers, ordered reassembly, and duplicate suppression — the standard construction for reliable messaging over UDP. One connection carries unreliable state and reliable events side by side: a position stream goes `Unreliable`, a "player joined" event goes `ReliableOrdered`, and neither blocks the other. The reliability endpoint is transport-agnostic and is verified against simulated packet loss, reordering, and duplication rather than only over loopback.
 
-## 4. Authentication and authorization (planned)
+Reliable traffic is paced by additive-increase / multiplicative-decrease congestion control: the number of unacknowledged fragments in flight is bounded by a window that grows by one per acknowledgement and halves on a retransmission, so a lossy link is not flooded with retransmissions. This is verified by the loss simulation, which confirms the window backs off under loss while every reliable message still arrives in order.
 
-The substrate is designed for untrusted peers from the start. The connection handshake becomes a token-and-challenge exchange that establishes a per-peer identity the broker trusts, independent of transport address, which also resolves the UDP identity caveat above. On top of identity, per-topic authorization decides which topics a peer may publish to and subscribe from, so a client can only affect what it is permitted to. Per-packet encryption protects confidentiality and integrity on the wire. Until this lands, the bind address remains the security boundary, as it is for the existing transports.
+## 4. Encryption (feature `secure`)
 
-## 5. Time and tick primitives (planned)
+With the `secure` feature, every UDP datagram is sealed with ChaCha20-Poly1305 under a key derived from a passphrase all legitimate peers share. A broker started with `start_udp_listener_secure(&broker, address, passphrase)` accepts only clients created with `create_udp_client_secure(name, address, passphrase)` and the same passphrase: a datagram that does not decrypt is dropped before any peer state is allocated, so a stranger can neither read the bus, publish to it, nor even open a connection. This closes the "anyone who reaches the port can subscribe and publish" hole for a group that shares a secret, and it is validated by round-trip, tamper-rejection, and wrong-key tests.
 
-Prediction, interpolation, and rollback all need a shared sense of time and a handle on in-flight messages. hearsay supplies the raw material: a broker-authoritative tick clock, round-trip and jitter estimates per peer, and the sequence and acknowledgement state the delivery layer already tracks, surfaced to the application. hearsay provides the clock and the numbers; the layer above decides how to predict, interpolate, and reconcile against them.
+It is a shared-key gate, not per-user authentication: it does not distinguish one key holder from another, so a holder can still publish under another's identity. Preventing that needs server-signed per-identity tokens, a further layer this does not provide — appropriate for a trusted group (a private server passphrase), not for public matchmaking among mutually untrusting players.
+
+## 5. Time primitives
+
+The reliability endpoint measures the smoothed round-trip time and jitter to its peer from acknowledgement timing, using Karn's algorithm so a retransmitted packet never skews the estimate. The UDP client exposes them as `udp_rtt_millis(&client)` (`None` until the first acknowledgement) and `udp_jitter_millis(&client)`. These are the raw measurements prediction, interpolation, and reconciliation build on; the tick clock and the policy that uses it stay in the layer above, coupled to the world model.
+
+## 5b. NAT traversal (feature `nat`, experimental)
+
+Because clients connect outbound to the broker, hosting the broker on a publicly reachable machine already traverses NAT — that relay path is the recommended answer and needs no extra code. For direct peer-to-peer between two hosts behind separate NATs, the `nat` feature adds a rendezvous: `start_rendezvous(address)` pairs peers by session id and tells each the other's observed public address, and `punch(&socket, rendezvous, session)` registers, learns the peer's address, and sends a burst of datagrams to open the local NAT mapping.
+
+This is **experimental and unverified against real NATs** — it cannot be tested without two machines behind two NATs. The test validates only the coordination path on a single machine (registration, observed-address exchange, and a direct datagram once each side knows the other). Treat direct traversal as best-effort and fall back to the broker as a public relay when it fails.
 
 ## 6. The boundary
 
@@ -76,7 +86,7 @@ To keep hearsay reusable and uncoupled from any application's state model, the l
 | transports and framing | entity and component replication |
 | routing and subscriptions | client-side prediction |
 | delivery classes (reliability, ordering) | interpolation and smoothing |
-| authentication and authorization | rollback and reconciliation |
-| the authoritative clock and RTT/jitter | the world model and game rules |
+| congestion control and encryption | rollback and reconciliation |
+| RTT and jitter measurement | the tick clock policy, world model, and game rules |
 
 Everything hearsay provides is expressed in terms of topics, messages, peers, and time — never entities, components, or frames of simulation. That boundary is what lets the same bus coordinate windows of a desktop application and carry the netcode of a networked one without knowing the difference.

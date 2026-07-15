@@ -64,10 +64,12 @@ Because every code path acquires at most one of the two locks at a time, lock-or
 ## 6. Features
 
 - `spawn = ["tokio/process"]` adds broker-owned process management. No new third-party dependencies.
-- `udp = []` adds the UDP transport and its reliability layer for latency-sensitive traffic with per-message delivery classes ([NETWORKING.md](NETWORKING.md)). No new third-party dependencies.
+- `udp = []` adds the UDP transport and its reliability layer (with RTT/jitter measurement and congestion control) for latency-sensitive traffic with per-message delivery classes ([NETWORKING.md](NETWORKING.md)). No new third-party dependencies.
+- `secure = ["udp", ...]` encrypts UDP datagrams with a shared passphrase (ChaCha20-Poly1305), so only key holders can join, read, or publish.
+- `nat = ["udp"]` adds an experimental UDP hole-punching rendezvous for direct peer-to-peer; validated only for the coordination path on one machine.
 - `websockets = ["dep:tokio-tungstenite", "dep:futures-util"]` adds the WebSocket listener.
 
-All three are additive: the default build is the TCP broker, client, contracts, batching, and lifecycle runner only. CI checks the crate with no features, with all targets, and with all features, so the default surface can never silently depend on an optional one.
+All are additive: the default build is the TCP broker, client, contracts, batching, and lifecycle runner only. CI checks the crate with no features, with all targets, and with all features, so the default surface can never silently depend on an optional one.
 
 ## 7. Errors
 

@@ -63,6 +63,10 @@ run-demo-nightshade:
 run-demo-leptos:
     just --justfile demo-nightshade-leptos/justfile --working-directory demo-nightshade-leptos run
 
+# Runs the cubelink two-player networked game demo (launches both windows)
+run-cubelink:
+    just --justfile demo-cubelink/justfile --working-directory demo-cubelink play
+
 # Runs all tests
 test:
     cargo test --all --all-features -- --nocapture

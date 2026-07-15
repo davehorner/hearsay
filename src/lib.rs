@@ -10,8 +10,12 @@ mod broker;
 #[cfg(not(target_arch = "wasm32"))]
 mod client;
 mod contract;
+#[cfg(all(feature = "udp", not(target_arch = "wasm32")))]
+mod crypto;
 #[cfg(not(target_arch = "wasm32"))]
 mod lifecycle;
+#[cfg(all(feature = "nat", not(target_arch = "wasm32")))]
+mod nat;
 #[cfg(all(feature = "udp", not(target_arch = "wasm32")))]
 mod reliability;
 #[cfg(all(feature = "spawn", not(target_arch = "wasm32")))]
@@ -44,6 +48,9 @@ pub use self::spawn::*;
 
 #[cfg(all(feature = "udp", not(target_arch = "wasm32")))]
 pub use self::{reliability::Delivery, udp::*, udp_client::*};
+
+#[cfg(all(feature = "nat", not(target_arch = "wasm32")))]
+pub use self::nat::*;
 
 #[cfg(all(feature = "websockets", not(target_arch = "wasm32")))]
 pub use self::websocket::*;

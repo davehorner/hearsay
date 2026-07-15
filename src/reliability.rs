@@ -30,6 +30,10 @@ pub(crate) const MAX_FRAGMENT_PAYLOAD: usize = 1024;
 const RESEND_TIMEOUT_MILLIS: u64 = 100;
 const ACK_HISTORY: u16 = 32;
 
+const INITIAL_CONGESTION_WINDOW: usize = 32;
+const MIN_CONGESTION_WINDOW: usize = 4;
+const MAX_CONGESTION_WINDOW: usize = 256;
+
 fn sequence_greater(lhs: u16, rhs: u16) -> bool {
     ((lhs > rhs) && (lhs - rhs <= u16::MAX / 2)) || ((lhs < rhs) && (rhs - lhs > u16::MAX / 2))
 }
@@ -40,6 +44,7 @@ struct OutgoingFragment {
     fragment_count: u16,
     payload: Bytes,
     last_sent_millis: Option<u64>,
+    sends: u32,
 }
 
 struct Reassembly {
@@ -66,6 +71,9 @@ pub(crate) struct Endpoint {
     delivered_reliable_through: Option<u32>,
     completed_reliable: HashMap<u32, Bytes>,
     dirty: bool,
+    smoothed_rtt_millis: Option<f64>,
+    jitter_millis: f64,
+    congestion_window: usize,
 }
 
 impl Endpoint {
@@ -84,6 +92,35 @@ impl Endpoint {
             delivered_reliable_through: None,
             completed_reliable: HashMap::new(),
             dirty: false,
+            smoothed_rtt_millis: None,
+            jitter_millis: 0.0,
+            congestion_window: INITIAL_CONGESTION_WINDOW,
+        }
+    }
+
+    /// The smoothed round-trip time estimate in milliseconds, or `None` until a
+    /// reliable message has been acknowledged. Measured only from
+    /// non-retransmitted packets (Karn's algorithm) so a lost-and-resent
+    /// packet never corrupts the estimate.
+    pub(crate) fn rtt_millis(&self) -> Option<u32> {
+        self.smoothed_rtt_millis.map(|rtt| rtt.round() as u32)
+    }
+
+    /// The round-trip jitter estimate in milliseconds.
+    pub(crate) fn jitter_millis(&self) -> u32 {
+        self.jitter_millis.round() as u32
+    }
+
+    fn sample_rtt(&mut self, sample: f64) {
+        match self.smoothed_rtt_millis {
+            None => {
+                self.smoothed_rtt_millis = Some(sample);
+                self.jitter_millis = sample / 2.0;
+            }
+            Some(rtt) => {
+                self.jitter_millis = self.jitter_millis * 0.75 + (sample - rtt).abs() * 0.25;
+                self.smoothed_rtt_millis = Some(rtt * 0.875 + sample * 0.125);
+            }
         }
     }
 
@@ -119,6 +156,7 @@ impl Endpoint {
                         fragment_count: 1,
                         payload: Bytes::new(),
                         last_sent_millis: None,
+                        sends: 0,
                     });
                 } else {
                     for (index, chunk) in payload.chunks(MAX_FRAGMENT_PAYLOAD).enumerate() {
@@ -128,6 +166,7 @@ impl Endpoint {
                             fragment_count,
                             payload: Bytes::copy_from_slice(chunk),
                             last_sent_millis: None,
+                            sends: 0,
                         });
                     }
                 }
@@ -156,18 +195,43 @@ impl Endpoint {
             out.push(packet.freeze());
         }
 
+        // Congestion control: retransmissions of already-sent fragments always
+        // go (they are already counted against the window), but a fresh
+        // fragment is only sent while the number in flight is under the
+        // window. The window grows by one per acknowledgement and halves on a
+        // retransmission, the standard additive-increase / multiplicative-
+        // decrease response to loss.
+        let window = self.congestion_window;
+        let mut in_flight = self
+            .outgoing_reliable
+            .iter()
+            .filter(|fragment| fragment.last_sent_millis.is_some())
+            .count();
+        let mut retransmitted = false;
         let mut resent: Vec<(u16, u32, u16)> = Vec::new();
-        for fragment in &mut self.outgoing_reliable {
-            let due = match fragment.last_sent_millis {
-                None => true,
-                Some(sent) => now_millis.saturating_sub(sent) >= RESEND_TIMEOUT_MILLIS,
+        for index in 0..self.outgoing_reliable.len() {
+            let (never_sent, due, message_id, fragment_index, fragment_count, payload) = {
+                let fragment = &self.outgoing_reliable[index];
+                let never_sent = fragment.last_sent_millis.is_none();
+                let due = match fragment.last_sent_millis {
+                    None => in_flight < window,
+                    Some(sent) => now_millis.saturating_sub(sent) >= RESEND_TIMEOUT_MILLIS,
+                };
+                (
+                    never_sent,
+                    due,
+                    fragment.message_id,
+                    fragment.fragment_index,
+                    fragment.fragment_count,
+                    fragment.payload.clone(),
+                )
             };
             if !due {
                 continue;
             }
             let sequence = self.next_packet_sequence;
             self.next_packet_sequence = self.next_packet_sequence.wrapping_add(1);
-            let mut packet = BytesMut::with_capacity(PACKET_HEADER + 16 + fragment.payload.len());
+            let mut packet = BytesMut::with_capacity(PACKET_HEADER + 16 + payload.len());
             write_header(
                 &mut packet,
                 sequence,
@@ -175,14 +239,25 @@ impl Endpoint {
                 self.remote_ack_bits,
             );
             packet.put_u8(CHANNEL_RELIABLE);
-            packet.put_u32(fragment.message_id);
-            packet.put_u16(fragment.fragment_index);
-            packet.put_u16(fragment.fragment_count);
-            packet.put_u16(fragment.payload.len() as u16);
-            packet.put_slice(&fragment.payload);
-            fragment.last_sent_millis = Some(now_millis);
-            resent.push((sequence, fragment.message_id, fragment.fragment_index));
+            packet.put_u32(message_id);
+            packet.put_u16(fragment_index);
+            packet.put_u16(fragment_count);
+            packet.put_u16(payload.len() as u16);
+            packet.put_slice(&payload);
             out.push(packet.freeze());
+
+            let fragment = &mut self.outgoing_reliable[index];
+            fragment.last_sent_millis = Some(now_millis);
+            fragment.sends += 1;
+            if never_sent {
+                in_flight += 1;
+            } else {
+                retransmitted = true;
+            }
+            resent.push((sequence, message_id, fragment_index));
+        }
+        if retransmitted {
+            self.congestion_window = (self.congestion_window / 2).max(MIN_CONGESTION_WINDOW);
         }
         for (sequence, message_id, fragment_index) in resent {
             self.sent_reliable_packets
@@ -213,7 +288,7 @@ impl Endpoint {
     /// Consumes an inbound datagram, appending any messages it completes to
     /// `delivered` (reliable messages in send order). Malformed datagrams are
     /// ignored.
-    pub(crate) fn receive(&mut self, datagram: &[u8], delivered: &mut Vec<Bytes>) {
+    pub(crate) fn receive(&mut self, now_millis: u64, datagram: &[u8], delivered: &mut Vec<Bytes>) {
         if datagram.len() < PACKET_HEADER {
             return;
         }
@@ -221,7 +296,7 @@ impl Endpoint {
         let sequence = cursor.get_u16();
         let ack = cursor.get_u16();
         let ack_bits = cursor.get_u32();
-        self.process_acks(ack, ack_bits);
+        self.process_acks(now_millis, ack, ack_bits);
         self.record_received(sequence);
 
         let Some(kind) = read_u8(&mut cursor) else {
@@ -317,24 +392,40 @@ impl Endpoint {
         }
     }
 
-    fn process_acks(&mut self, ack: u16, ack_bits: u32) {
-        self.acknowledge(ack);
+    fn process_acks(&mut self, now_millis: u64, ack: u16, ack_bits: u32) {
+        self.acknowledge(now_millis, ack);
         for offset in 0..ACK_HISTORY {
             if ack_bits & (1 << offset) != 0 {
-                self.acknowledge(ack.wrapping_sub(offset + 1));
+                self.acknowledge(now_millis, ack.wrapping_sub(offset + 1));
             }
         }
     }
 
-    fn acknowledge(&mut self, packet_sequence: u16) {
+    fn acknowledge(&mut self, now_millis: u64, packet_sequence: u16) {
         let Some((message_id, fragment_index)) =
             self.sent_reliable_packets.remove(&packet_sequence)
         else {
             return;
         };
+        // Karn's algorithm: only sample RTT from a fragment sent exactly once,
+        // so an ack that could be for either the original or a retransmission
+        // never skews the estimate.
+        let sample = self
+            .outgoing_reliable
+            .iter()
+            .find(|fragment| {
+                fragment.message_id == message_id && fragment.fragment_index == fragment_index
+            })
+            .filter(|fragment| fragment.sends == 1)
+            .and_then(|fragment| fragment.last_sent_millis)
+            .map(|sent| now_millis.saturating_sub(sent) as f64);
         self.outgoing_reliable.retain(|fragment| {
             !(fragment.message_id == message_id && fragment.fragment_index == fragment_index)
         });
+        if let Some(sample) = sample {
+            self.sample_rtt(sample);
+        }
+        self.congestion_window = (self.congestion_window + 1).min(MAX_CONGESTION_WINDOW);
     }
 
     fn record_received(&mut self, sequence: u16) {
@@ -461,9 +552,9 @@ mod tests {
             self.in_flight.retain(|(at, _, _)| *at > now);
             for (forward, datagram) in due {
                 if forward {
-                    forward_endpoint.receive(&datagram, forward_delivered);
+                    forward_endpoint.receive(now, &datagram, forward_delivered);
                 } else {
-                    backward_endpoint.receive(&datagram, backward_delivered);
+                    backward_endpoint.receive(now, &datagram, backward_delivered);
                 }
             }
         }
@@ -570,9 +661,9 @@ mod tests {
         assert_eq!(datagrams.len(), 3);
 
         let mut delivered = Vec::new();
-        receiver.receive(&datagrams[2], &mut delivered); // third
-        receiver.receive(&datagrams[0], &mut delivered); // first, now stale
-        receiver.receive(&datagrams[1], &mut delivered); // second, still stale
+        receiver.receive(0, &datagrams[2], &mut delivered); // third
+        receiver.receive(0, &datagrams[0], &mut delivered); // first, now stale
+        receiver.receive(0, &datagrams[1], &mut delivered); // second, still stale
 
         assert_eq!(delivered.len(), 1);
         assert_eq!(delivered[0].as_ref(), b"third");
@@ -589,7 +680,7 @@ mod tests {
 
         let mut delivered = Vec::new();
         // Drop the first datagram entirely; unreliable never recovers it.
-        receiver.receive(&datagrams[1], &mut delivered);
+        receiver.receive(0, &datagrams[1], &mut delivered);
         assert_eq!(delivered.len(), 1);
         assert_eq!(delivered[0].as_ref(), b"b");
     }
@@ -603,10 +694,104 @@ mod tests {
         sender.drain_outgoing(0, &mut datagrams);
 
         let mut delivered = Vec::new();
-        receiver.receive(&datagrams[0], &mut delivered);
-        receiver.receive(&datagrams[0], &mut delivered);
+        receiver.receive(0, &datagrams[0], &mut delivered);
+        receiver.receive(0, &datagrams[0], &mut delivered);
         assert_eq!(delivered.len(), 1);
         assert_eq!(delivered[0].as_ref(), b"only-once");
+    }
+
+    #[test]
+    fn rtt_is_estimated_from_a_clean_round_trip() {
+        // A fixed one-way latency and no loss, driven in 10ms steps: the
+        // estimate should land near two times the latency and never be zero.
+        let latency = 30;
+        let mut sender = Endpoint::new();
+        let mut receiver = Endpoint::new();
+        let mut pipe: Vec<(u64, bool, Bytes)> = Vec::new();
+        let mut delivered: Vec<Bytes> = Vec::new();
+        let mut discard: Vec<Bytes> = Vec::new();
+
+        sender.send(Delivery::ReliableOrdered, b"ping");
+        let mut now = 0;
+        while sender.rtt_millis().is_none() && now < 5_000 {
+            let mut from_sender = Vec::new();
+            sender.drain_outgoing(now, &mut from_sender);
+            for datagram in from_sender {
+                pipe.push((now + latency, true, datagram));
+            }
+            let mut from_receiver = Vec::new();
+            receiver.drain_outgoing(now, &mut from_receiver);
+            for datagram in from_receiver {
+                pipe.push((now + latency, false, datagram));
+            }
+            let due: Vec<(bool, Bytes)> = pipe
+                .iter()
+                .filter(|(at, _, _)| *at <= now)
+                .map(|(_, forward, datagram)| (*forward, datagram.clone()))
+                .collect();
+            pipe.retain(|(at, _, _)| *at > now);
+            for (forward, datagram) in due {
+                if forward {
+                    receiver.receive(now, &datagram, &mut delivered);
+                } else {
+                    sender.receive(now, &datagram, &mut discard);
+                }
+            }
+            now += 10;
+        }
+
+        let rtt = sender.rtt_millis().expect("an rtt estimate after the ack");
+        assert!(
+            (latency as u32..=(latency as u32 * 4)).contains(&rtt),
+            "rtt {rtt} should reflect the ~{}ms round trip",
+            latency * 2
+        );
+    }
+
+    #[test]
+    fn the_congestion_window_backs_off_under_loss_then_recovers() {
+        let mut sender = Endpoint::new();
+        let mut receiver = Endpoint::new();
+        let mut link = Link::new(0xc0ffee, 50);
+
+        let total = 120;
+        for index in 0..total {
+            sender.send(Delivery::ReliableOrdered, &index_payload(index));
+        }
+
+        let mut delivered: Vec<Bytes> = Vec::new();
+        let mut discard: Vec<Bytes> = Vec::new();
+        let mut now = 0;
+        let mut minimum_window = INITIAL_CONGESTION_WINDOW;
+        while delivered.len() < total as usize && now < 1_000_000 {
+            let mut from_sender = Vec::new();
+            sender.drain_outgoing(now, &mut from_sender);
+            minimum_window = minimum_window.min(sender.congestion_window);
+            link.enqueue(now, true, from_sender);
+            let mut from_receiver = Vec::new();
+            receiver.drain_outgoing(now, &mut from_receiver);
+            link.enqueue(now, false, from_receiver);
+            link.deliver_due(
+                now,
+                &mut receiver,
+                &mut sender,
+                &mut delivered,
+                &mut discard,
+            );
+            now += 15;
+        }
+
+        // Loss forced the window down at some point, yet every reliable message
+        // still arrives in order — congestion control paces without stalling.
+        assert!(
+            minimum_window < INITIAL_CONGESTION_WINDOW,
+            "the window should have backed off under 50% loss"
+        );
+        assert!(sender.congestion_window >= MIN_CONGESTION_WINDOW);
+        assert_eq!(delivered.len(), total as usize);
+        for (index, message) in delivered.iter().enumerate() {
+            assert_eq!(message.as_ref(), index_payload(index as u32).as_slice());
+        }
     }
 
     fn index_payload(index: u32) -> Vec<u8> {
