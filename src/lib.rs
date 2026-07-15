@@ -10,8 +10,6 @@ mod broker;
 #[cfg(not(target_arch = "wasm32"))]
 mod client;
 mod contract;
-#[cfg(all(feature = "udp", not(target_arch = "wasm32")))]
-mod crypto;
 #[cfg(not(target_arch = "wasm32"))]
 mod lifecycle;
 #[cfg(all(feature = "nat", not(target_arch = "wasm32")))]

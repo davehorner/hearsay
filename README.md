@@ -54,7 +54,6 @@ The bus runs for as long as the `Broker` is held; `stop_broker` (or dropping it)
 |---------|------|
 | `websockets` | The broker accepts WebSocket peers, so browser and WASM apps participate directly |
 | `udp` | The broker accepts UDP peers with per-message delivery guarantees (unreliable or reliable-ordered) for latency-sensitive traffic, sharing one subscription table with TCP and WebSocket peers |
-| `secure` | UDP datagrams are encrypted with a shared passphrase, so only peers holding it can join, read, or publish |
 | `nat` | Experimental UDP hole-punching rendezvous for direct peer-to-peer between hosts behind NAT |
 | `spawn` | The broker owns, supervises, and restarts client app processes |
 

@@ -4,7 +4,7 @@ A two-player game on the [nightshade](https://crates.io/crates/nightshade-api) e
 
 Each player drives a cube around a large floor with a pan-orbit view (drag to orbit, scroll to zoom), and the two players chat over a retained-UI panel.
 
-Networking is host-authoritative: guests send only their movement input, and the host owns every cube's position, applies the movement rules, and broadcasts the authoritative positions unreliably (the freshest wins). A guest cannot teleport or move faster than the rules allow, because it never sends a position. Chat is published reliably and in order. All traffic is encrypted with a shared passphrase, so only the two players can join or read the session.
+Networking is host-authoritative: guests send only their movement input, and the host owns every cube's position, applies the movement rules, and broadcasts the authoritative positions unreliably (the freshest wins). A guest cannot teleport or move faster than the rules allow, because it never sends a position. Chat is published reliably and in order.
 
 ## Play
 

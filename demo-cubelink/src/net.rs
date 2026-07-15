@@ -1,17 +1,15 @@
-//! The networking seam: hearsay's encrypted UDP transport on a background tokio
-//! thread, bridged to the synchronous game loop with unbounded channels.
+//! The networking seam: hearsay's UDP transport on a background tokio thread,
+//! bridged to the synchronous game loop with unbounded channels.
 //!
 //! The model is host-authoritative. Guests send only their *input* (a movement
 //! direction); the host owns every cube's position, applies the movement rules
 //! itself, and broadcasts the authoritative positions. A guest therefore cannot
 //! teleport or move faster than the rules allow by lying about its position —
-//! it never sends one. Chat is exchanged reliably in both directions. All
-//! traffic is encrypted with a shared passphrase, so only the two players can
-//! join or read the session.
+//! it never sends one. Chat is exchanged reliably in both directions.
 
 use hearsay::{
-    Delivery, create_udp_client_secure, next_udp_message, start_broker, start_udp_listener_secure,
-    udp_publish, udp_subscribe,
+    Delivery, create_udp_client, next_udp_message, start_broker, start_udp_listener, udp_publish,
+    udp_subscribe,
 };
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -23,7 +21,6 @@ const BROKER_TCP_BIND: &str = "0.0.0.0:9500";
 const UDP_LISTEN_BIND: &str = "0.0.0.0:9501";
 const UDP_PORT: u16 = 9501;
 const LOOPBACK_HOST: &str = "127.0.0.1";
-const PASSPHRASE: &str = "cubelink";
 const INPUT_TOPIC: &str = "input";
 const STATE_TOPIC: &str = "state";
 const CHAT_TOPIC: &str = "chat";
@@ -115,7 +112,7 @@ async fn network_main(
     let _broker = if is_host {
         match start_broker(BROKER_TCP_BIND).await {
             Ok(broker) => {
-                let _ = start_udp_listener_secure(&broker, UDP_LISTEN_BIND, PASSPHRASE).await;
+                let _ = start_udp_listener(&broker, UDP_LISTEN_BIND).await;
                 Some(broker)
             }
             Err(_) => None,
@@ -125,8 +122,7 @@ async fn network_main(
     };
 
     let client = loop {
-        match create_udp_client_secure(&format!("player{my_id}"), &connect_address, PASSPHRASE).await
-        {
+        match create_udp_client(&format!("player{my_id}"), &connect_address).await {
             Ok(client) => break client,
             Err(_) => tokio::time::sleep(Duration::from_millis(500)).await,
         }

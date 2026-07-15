@@ -65,7 +65,6 @@ Because every code path acquires at most one of the two locks at a time, lock-or
 
 - `spawn = ["tokio/process"]` adds broker-owned process management. No new third-party dependencies.
 - `udp = []` adds the UDP transport and its reliability layer (with RTT/jitter measurement and congestion control) for latency-sensitive traffic with per-message delivery classes ([NETWORKING.md](NETWORKING.md)). No new third-party dependencies.
-- `secure = ["udp", ...]` encrypts UDP datagrams with a shared passphrase (ChaCha20-Poly1305), so only key holders can join, read, or publish.
 - `nat = ["udp"]` adds an experimental UDP hole-punching rendezvous for direct peer-to-peer; validated only for the coordination path on one machine.
 - `websockets = ["dep:tokio-tungstenite", "dep:futures-util"]` adds the WebSocket listener.
 

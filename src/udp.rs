@@ -2,7 +2,6 @@ use crate::{
     Result,
     arena::PeerId,
     broker::{Broker, BrokerEvent, PeerWriter, process_incoming_frame, resolve_address},
-    crypto::Cipher,
     reliability::{Delivery, Endpoint},
 };
 use bytes::{Bytes, BytesMut};
@@ -45,28 +44,6 @@ const HEADER_LENGTH: usize = 8;
 /// the transport substrate for latency-sensitive networking; see
 /// [NETWORKING.md](https://github.com/matthewjberger/hearsay/blob/main/docs/NETWORKING.md).
 pub async fn start_udp_listener(broker: &Broker, address: &str) -> Result<()> {
-    start_udp_listener_with_cipher(broker, address, None).await
-}
-
-/// Like [`start_udp_listener`], but every datagram is encrypted with a key
-/// derived from `passphrase`. Only peers that connect with
-/// [`crate::create_udp_client_secure`] and the same passphrase can join, read,
-/// or publish; a datagram that does not decrypt is dropped without allocating
-/// any peer state, so a stranger cannot even open a connection.
-#[cfg(feature = "secure")]
-pub async fn start_udp_listener_secure(
-    broker: &Broker,
-    address: &str,
-    passphrase: &str,
-) -> Result<()> {
-    start_udp_listener_with_cipher(broker, address, Some(Cipher::from_passphrase(passphrase))).await
-}
-
-async fn start_udp_listener_with_cipher(
-    broker: &Broker,
-    address: &str,
-    cipher: Option<Cipher>,
-) -> Result<()> {
     let socket = Arc::new(UdpSocket::bind(resolve_address(address).await?).await?);
     let (outbound_sender, outbound_receiver) = mpsc::channel(OUTBOUND_CAPACITY);
     tokio::spawn(udp_listen_loop(
@@ -75,7 +52,6 @@ async fn start_udp_listener_with_cipher(
         outbound_sender,
         outbound_receiver,
         broker.shutdown_sender.subscribe(),
-        cipher,
     ));
     Ok(())
 }
@@ -102,14 +78,12 @@ impl UdpPeer {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn udp_listen_loop(
     socket: Arc<UdpSocket>,
     event_sender: Sender<BrokerEvent>,
     outbound_sender: Sender<(SocketAddr, Bytes)>,
     mut outbound_receiver: mpsc::Receiver<(SocketAddr, Bytes)>,
     mut shutdown: watch::Receiver<bool>,
-    cipher: Option<Cipher>,
 ) {
     let mut peers: HashMap<SocketAddr, UdpPeer> = HashMap::new();
     let mut retransmit = tokio::time::interval(RETRANSMIT_INTERVAL);
@@ -131,7 +105,6 @@ async fn udp_listen_loop(
                     address,
                     datagram,
                     now_millis,
-                    &cipher,
                 )
                 .await;
             }
@@ -146,7 +119,7 @@ async fn udp_listen_loop(
                         Delivery::Unreliable
                     };
                     peer.endpoint.send(delivery, &frame);
-                    flush_peer(&socket, address, peer, now_millis, &cipher).await;
+                    flush_peer(&socket, address, peer, now_millis).await;
                 }
             }
             _ = retransmit.tick() => {
@@ -158,7 +131,7 @@ async fn udp_listen_loop(
                 }
                 for address in addresses {
                     if let Some(peer) = peers.get_mut(&address) {
-                        flush_peer(&socket, address, peer, now_millis, &cipher).await;
+                        flush_peer(&socket, address, peer, now_millis).await;
                     }
                 }
                 expire_idle_peers(&mut peers);
@@ -168,7 +141,6 @@ async fn udp_listen_loop(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn receive_datagram(
     socket: &Arc<UdpSocket>,
     event_sender: &Sender<BrokerEvent>,
@@ -177,19 +149,7 @@ async fn receive_datagram(
     address: SocketAddr,
     datagram: Bytes,
     now_millis: u64,
-    cipher: &Option<Cipher>,
 ) {
-    // Decrypt before touching peer state: a datagram that does not decrypt is a
-    // stranger without the key, and dropping it here means no peer slot is ever
-    // allocated for one.
-    let datagram = match cipher {
-        Some(cipher) => match cipher.open(&datagram) {
-            Some(plaintext) => Bytes::from(plaintext),
-            None => return,
-        },
-        None => datagram,
-    };
-
     let peer = match peers.entry(address) {
         Entry::Occupied(occupied) => occupied.into_mut(),
         Entry::Vacant(vacant) => vacant.insert(UdpPeer::new(outbound_sender.clone(), address)),
@@ -219,27 +179,14 @@ async fn receive_datagram(
             break;
         }
     }
-    flush_peer(socket, address, peer, now_millis, cipher).await;
+    flush_peer(socket, address, peer, now_millis).await;
 }
 
-async fn flush_peer(
-    socket: &UdpSocket,
-    address: SocketAddr,
-    peer: &mut UdpPeer,
-    now_millis: u64,
-    cipher: &Option<Cipher>,
-) {
+async fn flush_peer(socket: &UdpSocket, address: SocketAddr, peer: &mut UdpPeer, now_millis: u64) {
     let mut datagrams: Vec<Bytes> = Vec::new();
     peer.endpoint.drain_outgoing(now_millis, &mut datagrams);
     for datagram in datagrams {
-        match cipher {
-            Some(cipher) => {
-                let _ = socket.send_to(&cipher.seal(&datagram), address).await;
-            }
-            None => {
-                let _ = socket.send_to(&datagram, address).await;
-            }
-        }
+        let _ = socket.send_to(&datagram, address).await;
     }
 }
 

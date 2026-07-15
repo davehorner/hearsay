@@ -4,7 +4,7 @@
 //! Networking is host-authoritative (see `net.rs`). Guests send only their
 //! movement input; the host owns every cube's position, applies the movement
 //! rules, and broadcasts authoritative positions unreliably. Chat goes
-//! reliably. All traffic is encrypted with a shared passphrase.
+//! reliably.
 
 mod net;
 
@@ -132,7 +132,16 @@ fn drive(world: &mut World, game: &mut Game) {
         // broadcasts the result. A guest can only influence its own input.
         game.inputs[game.own_id as usize] = local_input;
         for id in 0..game.cubes.len() {
-            let input = game.inputs[id];
+            // Clamp the input to unit length before applying speed, so a guest
+            // cannot move faster than the rules allow by sending an oversized
+            // input vector. This is what makes the authority meaningful.
+            let raw = game.inputs[id];
+            let magnitude = (raw[0] * raw[0] + raw[1] * raw[1]).sqrt();
+            let input = if magnitude > 1.0 {
+                [raw[0] / magnitude, raw[1] / magnitude]
+            } else {
+                raw
+            };
             let mut next = game.positions[id];
             next[0] = (next[0] + input[0] * MOVE_SPEED * delta)
                 .clamp(-FLOOR_HALF_EXTENT, FLOOR_HALF_EXTENT);

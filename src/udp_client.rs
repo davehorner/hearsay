@@ -1,7 +1,5 @@
 use crate::{
-    Error, Message, Result,
-    crypto::Cipher,
-    decode_message,
+    Error, Message, Result, decode_message,
     reliability::{Delivery, Endpoint},
     wire::{
         encode_hello, encode_publish_binary, encode_publish_text, encode_subscribe,
@@ -60,32 +58,6 @@ enum Command {
 /// `Hello` handshake is sent reliably in the background; the returned client is
 /// usable immediately (subscriptions and publishes queue behind it in order).
 pub async fn create_udp_client(name: &str, broker_address: &str) -> Result<UdpClient> {
-    connect_udp_client(name, broker_address, None).await
-}
-
-/// Like [`create_udp_client`], but every datagram is encrypted with a key
-/// derived from `passphrase`. A peer without the passphrase can neither read
-/// this client's traffic nor forge a datagram the broker (started with
-/// [`crate::start_udp_listener_secure`] and the same passphrase) will accept.
-#[cfg(feature = "secure")]
-pub async fn create_udp_client_secure(
-    name: &str,
-    broker_address: &str,
-    passphrase: &str,
-) -> Result<UdpClient> {
-    connect_udp_client(
-        name,
-        broker_address,
-        Some(Cipher::from_passphrase(passphrase)),
-    )
-    .await
-}
-
-async fn connect_udp_client(
-    name: &str,
-    broker_address: &str,
-    cipher: Option<Cipher>,
-) -> Result<UdpClient> {
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
     socket.connect(broker_address).await?;
     let id: Box<str> = format!("{name}_{}", uuid::Uuid::new_v4()).into();
@@ -100,7 +72,6 @@ async fn connect_udp_client(
         id.clone(),
         command_receiver,
         inbound_sender,
-        cipher,
         stats.clone(),
     ));
     Ok(UdpClient {
@@ -189,7 +160,6 @@ async fn udp_client_task(
     id: Box<str>,
     mut commands: Receiver<Command>,
     inbound: Sender<Message>,
-    cipher: Option<Cipher>,
     stats: Arc<Stats>,
 ) {
     let mut endpoint = Endpoint::new();
@@ -197,7 +167,7 @@ async fn udp_client_task(
     if let Ok(hello) = encode_hello(&id) {
         endpoint.send(Delivery::ReliableOrdered, &hello);
     }
-    flush(&socket, &mut endpoint, started, &cipher).await;
+    flush(&socket, &mut endpoint, started).await;
 
     let mut retransmit = tokio::time::interval(RETRANSMIT_INTERVAL);
     let mut buffer = vec![0_u8; RECEIVE_BUFFER];
@@ -209,14 +179,7 @@ async fn udp_client_task(
                 };
                 let now_millis = started.elapsed().as_millis() as u64;
                 let mut delivered: Vec<Bytes> = Vec::new();
-                match &cipher {
-                    Some(cipher) => {
-                        if let Some(plaintext) = cipher.open(&buffer[..length]) {
-                            endpoint.receive(now_millis, &plaintext, &mut delivered);
-                        }
-                    }
-                    None => endpoint.receive(now_millis, &buffer[..length], &mut delivered),
-                }
+                endpoint.receive(now_millis, &buffer[..length], &mut delivered);
                 if let Some(rtt) = endpoint.rtt_millis() {
                     stats.rtt_millis.store(rtt, Ordering::Relaxed);
                     stats.jitter_millis.store(endpoint.jitter_millis(), Ordering::Relaxed);
@@ -228,7 +191,7 @@ async fn udp_client_task(
                         return;
                     }
                 }
-                flush(&socket, &mut endpoint, started, &cipher).await;
+                flush(&socket, &mut endpoint, started).await;
             }
             command = commands.recv() => {
                 match command {
@@ -247,32 +210,20 @@ async fn udp_client_task(
                     }
                     None => break,
                 }
-                flush(&socket, &mut endpoint, started, &cipher).await;
+                flush(&socket, &mut endpoint, started).await;
             }
             _ = retransmit.tick() => {
-                flush(&socket, &mut endpoint, started, &cipher).await;
+                flush(&socket, &mut endpoint, started).await;
             }
         }
     }
 }
 
-async fn flush(
-    socket: &UdpSocket,
-    endpoint: &mut Endpoint,
-    started: Instant,
-    cipher: &Option<Cipher>,
-) {
+async fn flush(socket: &UdpSocket, endpoint: &mut Endpoint, started: Instant) {
     let now_millis = started.elapsed().as_millis() as u64;
     let mut datagrams: Vec<Bytes> = Vec::new();
     endpoint.drain_outgoing(now_millis, &mut datagrams);
     for datagram in datagrams {
-        match cipher {
-            Some(cipher) => {
-                let _ = socket.send(&cipher.seal(&datagram)).await;
-            }
-            None => {
-                let _ = socket.send(&datagram).await;
-            }
-        }
+        let _ = socket.send(&datagram).await;
     }
 }
