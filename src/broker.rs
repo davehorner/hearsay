@@ -41,7 +41,7 @@ pub(crate) enum PeerWriter {
     Tcp(OwnedWriteHalf),
     #[cfg(feature = "udp")]
     Udp {
-        socket: Arc<tokio::net::UdpSocket>,
+        outbound: mpsc::Sender<(SocketAddr, Bytes)>,
         address: SocketAddr,
     },
     #[cfg(feature = "websockets")]
@@ -58,11 +58,14 @@ impl PeerWriter {
         match self {
             PeerWriter::Tcp(writer) => write_frames(writer, frames).await,
             #[cfg(feature = "udp")]
-            PeerWriter::Udp { socket, address } => {
+            PeerWriter::Udp { outbound, address } => {
                 for frame in frames {
-                    let datagram = frame.to_contiguous();
-                    if datagram.len() <= crate::udp::MAX_DATAGRAM_PAYLOAD {
-                        let _ = socket.send_to(&datagram, *address).await;
+                    if outbound
+                        .send((*address, frame.to_contiguous()))
+                        .await
+                        .is_err()
+                    {
+                        return Err(crate::Error::Transport("udp listener stopped".to_string()));
                     }
                 }
                 Ok(())

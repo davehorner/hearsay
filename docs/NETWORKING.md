@@ -23,30 +23,41 @@ let broker = hearsay::start_broker("127.0.0.1:9612").await?;
 hearsay::start_udp_listener(&broker, "127.0.0.1:9613").await?;
 ```
 
-Over a stream transport a connection is a socket. UDP has no connections, so hearsay models each source address as a **virtual connection**: one listener socket demultiplexes every peer by its remote address. A UDP peer is driven through exactly the same connection state machine as a TCP peer — it sends the same frames, beginning with `Hello`.
+Over a stream transport a connection is a socket. UDP has no connections, so hearsay models each source address as a **virtual connection**: one listener socket demultiplexes every peer by its remote address, each with its own reliability endpoint. A UDP peer is driven through the same connection state machine as a TCP peer — it sends the same frames, beginning with `Hello` — but those frames travel inside the reliability protocol described in section 3 rather than one-to-one with datagrams.
 
-- **Registration is Hello-gated.** The first datagram from an address must be a `Hello`; any other datagram from an unknown address is dropped without allocating state. A flood of spoofed source addresses therefore cannot grow the peer table.
-- **One frame per datagram, unreliable and unordered.** A published message is one datagram, sent best-effort. There is no retransmission, no acknowledgement, no ordering, and no de-duplication. A lost datagram is simply gone; a reordered one arrives out of order. This is the correct shape for high-frequency state (positions, transforms, inputs) where a dropped update is superseded by the next one and head-of-line blocking would be worse than loss.
-- **A malformed datagram does not disconnect the peer.** Over a stream, a frame that fails to parse means the stream is corrupt and the connection dies. Over UDP a single bad datagram is dropped and the peer survives, because unreliable delivery must tolerate corruption of individual datagrams.
-- **Liveness is timeout-based.** With no connection to close, a peer is considered gone when no datagram has arrived from its address for the idle timeout, at which point the broker tears it down exactly as it would a dropped TCP peer. A peer that only subscribes and never publishes must therefore send periodic traffic (a keepalive) to stay registered; continuous senders never notice.
-- **Datagrams are size-capped.** A frame whose encoding would exceed one datagram is dropped rather than sent. Application-level fragmentation for large reliable messages is part of the reliability work below, not this layer.
+```rust
+let client = hearsay::create_udp_client("player", "127.0.0.1:9613").await?;
+hearsay::udp_subscribe(&client, &["world/state"]).await?;
 
-Because the frame format is identical across transports, the broker fans a single reference-counted buffer out to TCP, WebSocket, and UDP subscribers alike; the UDP writer sends that buffer as a datagram with no re-encoding.
+// choose a guarantee per publish
+hearsay::udp_publish(&client, "input", &command, hearsay::Delivery::Unreliable).await?;
+hearsay::udp_publish(&client, "chat", &line, hearsay::Delivery::ReliableOrdered).await?;
+
+if let Some(message) = hearsay::next_udp_message(&client).await {
+    // ...
+}
+```
+
+- **Each peer runs a reliability endpoint.** A datagram is a reliability packet (sequence, acknowledgements, one message or fragment), not a bare frame. The `Hello` handshake and subscriptions are sent reliably and ordered; publishes carry whatever [`Delivery`](#3-delivery-classes) the caller chose. The broker delivers its coordination frames (`hearsay/` topics) reliably and application data unreliably, so control always arrives while high-frequency traffic stays best-effort.
+- **A malformed datagram does not disconnect the peer.** A datagram that fails to parse is dropped and the peer survives, because an unreliable transport must tolerate corruption of individual datagrams.
+- **Liveness is timeout-based.** With no connection to close, a peer is dropped when no datagram has arrived from its address for the idle timeout, and a peer that never completes its `Hello` is dropped sooner. A peer that only subscribes and never publishes must send periodic traffic to stay registered; a continuous sender never notices, and the reliability layer's own acknowledgement traffic counts.
+- **Large reliable messages fragment and reassemble.** A reliable message larger than one datagram is split into fragments, each retransmitted until acknowledged, and reassembled in order at the receiver.
+
+Because the frame format is identical across transports, once a UDP peer's endpoint has reassembled a frame the broker routes it through exactly the same path as a TCP or WebSocket frame, sharing one subscription table and one reference-counted delivery buffer.
 
 ### Identity caveat
 
-A UDP peer's identity is currently its source address. If a peer's address changes mid-session (NAT rebinding) it appears as a new peer, and if an address is reused within the idle-timeout window a new peer inheriting that address is misattributed to the old one. Address-independent identity is provided by the authentication layer below; until then, UDP identity is address-bound.
+A UDP peer's identity is its source address. If a peer's address changes mid-session (NAT rebinding) it appears as a new peer, and if an address is reused within the idle-timeout window a new peer inheriting that address is misattributed to the old one. Address-independent identity is provided by the authentication layer below; until then, UDP identity is address-bound.
 
-## 3. Delivery classes (planned)
+## 3. Delivery classes
 
-The UDP transport today provides the unreliable class. The full substrate exposes a delivery class per message, chosen by the publisher:
+Every UDP publish chooses a [`Delivery`], and control frames are always reliable and ordered:
 
-- **Unreliable** — fire and forget. (Available now over UDP.)
-- **Unreliable sequenced** — drop anything older than the newest seen; never deliver stale state.
-- **Reliable** — retransmit until acknowledged; delivery guaranteed, order not.
-- **Reliable ordered** — retransmit and deliver in order.
+- **`Unreliable`** — fire and forget. A lost datagram is gone; a reordered one arrives out of order. For high-frequency state (positions, transforms, inputs) where the next message supersedes this one and head-of-line blocking would be worse than loss.
+- **`UnreliableSequenced`** — like unreliable, but the receiver drops anything older than the newest it has seen, so stale state never arrives after fresh state.
+- **`ReliableOrdered`** — retransmitted until acknowledged and delivered in send order, with fragmentation for messages larger than one datagram.
 
-Reliability is layered on the unreliable datagram core with sequence numbers, acknowledgement bitfields, retransmission timers, and fragmentation for messages larger than one datagram — the standard construction for reliable messaging over UDP. This lets one connection carry unreliable state and reliable events side by side: a position stream goes unreliable, a "player joined" event goes reliable-ordered, and neither blocks the other.
+Reliability is layered on the datagram core with per-packet sequence numbers, acknowledgement bitfields, retransmission timers, ordered reassembly, and duplicate suppression — the standard construction for reliable messaging over UDP. One connection carries unreliable state and reliable events side by side: a position stream goes `Unreliable`, a "player joined" event goes `ReliableOrdered`, and neither blocks the other. The reliability endpoint is transport-agnostic and is verified against simulated packet loss, reordering, and duplication rather than only over loopback.
 
 ## 4. Authentication and authorization (planned)
 

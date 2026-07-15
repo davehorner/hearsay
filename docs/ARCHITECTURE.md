@@ -20,10 +20,12 @@ hearsay lets Rust programs talk to each other. One process hosts a broker; any n
 - `src/bridge.rs` is a thin internal wrapper: a `Bridge` is a `Client` connected to a remote broker, plus the identity and address the broker needs to manage it.
 - `src/lifecycle.rs` is the service runner: the `Lifecycle` trait and `run_lifecycle`.
 - `src/spawn.rs` (feature `spawn`) is broker-owned process management.
-- `src/udp.rs` (feature `udp`) is the UDP transport: a listener that multiplexes address-keyed virtual connections onto the broker for unreliable, latency-sensitive traffic. See [NETWORKING.md](NETWORKING.md).
+- `src/reliability.rs` (feature `udp`) is the transport-agnostic reliability layer: a pure `Endpoint` that turns an unordered, lossy datagram channel into per-message delivery classes (unreliable, unreliable-sequenced, reliable-ordered) with sequencing, acknowledgement, retransmission, fragmentation, and ordered reassembly. It has no I/O, so it is tested against simulated loss.
+- `src/udp.rs` (feature `udp`) is the broker-side UDP transport: a listener that multiplexes address-keyed virtual connections, each with its own reliability `Endpoint`, onto the broker. See [NETWORKING.md](NETWORKING.md).
+- `src/udp_client.rs` (feature `udp`) is the UDP client: a `UdpClient` that runs a reliability `Endpoint` over a connected socket and publishes with a chosen `Delivery`.
 - `src/websocket.rs` (feature `websockets`) is the WebSocket listener that lets browser and WASM peers join the broker.
 
-The dependency direction is strictly upward: `wire` and `contract` at the bottom; `client` and `batch` built on those; `bridge` reusing `client`; `broker` on top of all of them; `lifecycle`, `spawn`, `udp`, and `websocket` depending only on `client` and `broker`. There are no cycles.
+The dependency direction is strictly upward: `wire` and `contract` at the bottom; `client`, `batch`, and `reliability` built on those; `bridge` reusing `client`; `broker` on top; `lifecycle`, `spawn`, `websocket`, `udp`, and `udp_client` depending only on `client`, `broker`, and `reliability`. There are no cycles.
 
 On `wasm32` targets the crate compiles down to its protocol surface: `Message`, `Route`, `BrokerContract` and its payloads, `read_batch`, and the frame helpers (`encode_hello`, `encode_subscribe`, `encode_unsubscribe`, `encode_publish_text`, `encode_publish_binary`, `decode_message`). Everything tokio-backed (broker, client, bridge, lifecycle, spawn, websocket listener, the transport half of wire, the sending half of batching) is compiled out, and tokio, socket2, and uuid are target-gated dependencies that never appear in a wasm build. This is what lets a browser client depend on hearsay for the exact wire format instead of mirroring it; see [WEBSOCKETS.md](WEBSOCKETS.md) section 4. CI checks the wasm32 build on every push.
 
@@ -62,7 +64,7 @@ Because every code path acquires at most one of the two locks at a time, lock-or
 ## 6. Features
 
 - `spawn = ["tokio/process"]` adds broker-owned process management. No new third-party dependencies.
-- `udp = []` adds the UDP transport for unreliable, latency-sensitive traffic ([NETWORKING.md](NETWORKING.md)). No new third-party dependencies.
+- `udp = []` adds the UDP transport and its reliability layer for latency-sensitive traffic with per-message delivery classes ([NETWORKING.md](NETWORKING.md)). No new third-party dependencies.
 - `websockets = ["dep:tokio-tungstenite", "dep:futures-util"]` adds the WebSocket listener.
 
 All three are additive: the default build is the TCP broker, client, contracts, batching, and lifecycle runner only. CI checks the crate with no features, with all targets, and with all features, so the default surface can never silently depend on an optional one.

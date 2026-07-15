@@ -53,7 +53,7 @@ The bus runs for as long as the `Broker` is held; `stop_broker` (or dropping it)
 | Feature | Adds |
 |---------|------|
 | `websockets` | The broker accepts WebSocket peers, so browser and WASM apps participate directly |
-| `udp` | The broker accepts UDP peers for unreliable, latency-sensitive traffic, sharing one subscription table with TCP and WebSocket peers |
+| `udp` | The broker accepts UDP peers with per-message delivery guarantees (unreliable or reliable-ordered) for latency-sensitive traffic, sharing one subscription table with TCP and WebSocket peers |
 | `spawn` | The broker owns, supervises, and restarts client app processes |
 
 All are additive; the default build is the TCP broker, client, contracts, batching, and lifecycle runner.
@@ -80,9 +80,14 @@ hearsay = { version = "0.1", features = ["udp"] }
 ```rust
 let broker = hearsay::start_broker("127.0.0.1:9612").await?;
 hearsay::start_udp_listener(&broker, "127.0.0.1:9613").await?;
+
+let client = hearsay::create_udp_client("player", "127.0.0.1:9613").await?;
+hearsay::udp_subscribe(&client, &["world/state"]).await?;
+hearsay::udp_publish(&client, "input", &command, hearsay::Delivery::Unreliable).await?;
+hearsay::udp_publish(&client, "chat", &line, hearsay::Delivery::ReliableOrdered).await?;
 ```
 
-UDP peers share the broker's subscription table with TCP and WebSocket peers, but their traffic is unreliable and unordered (one frame per datagram, best-effort) — the right fit for latency-sensitive state where the freshest message matters more than every message. This is the transport substrate real-time networking builds on; see [docs/NETWORKING.md](docs/NETWORKING.md) for the transport model, delivery classes, and the authentication and timing primitives.
+UDP peers share the broker's subscription table with TCP and WebSocket peers, and every publish chooses a delivery guarantee: `Unreliable` for high-frequency state where the freshest message matters more than every message, `ReliableOrdered` for events that must arrive once, in order (fragmented and reassembled when large). It is the transport substrate real-time networking builds on; see [docs/NETWORKING.md](docs/NETWORKING.md) for the reliability model and the authentication and timing primitives that complete it.
 
 ## Spawn
 
