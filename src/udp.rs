@@ -34,26 +34,29 @@ const KIND_OFFSET: usize = 4;
 const KIND_DELIVER: u8 = 5;
 const HEADER_LENGTH: usize = 8;
 
-/// Starts a UDP transport on `address`, so peers can join the broker's bus
-/// over UDP alongside its TCP and WebSocket peers, sharing one subscription
-/// table.
-///
-/// UDP peers speak the reliability protocol ([`crate::reliability`]): control
-/// frames and reliably-published messages are retransmitted until acknowledged
-/// and delivered in order, while unreliable publishes are best-effort. This is
-/// the transport substrate for latency-sensitive networking; see
-/// [NETWORKING.md](https://github.com/matthewjberger/hearsay/blob/main/docs/NETWORKING.md).
-pub async fn start_udp_listener(broker: &Broker, address: &str) -> Result<()> {
-    let socket = Arc::new(UdpSocket::bind(resolve_address(address).await?).await?);
-    let (outbound_sender, outbound_receiver) = mpsc::channel(OUTBOUND_CAPACITY);
-    tokio::spawn(udp_listen_loop(
-        socket,
-        broker.sender.clone(),
-        outbound_sender,
-        outbound_receiver,
-        broker.shutdown_sender.subscribe(),
-    ));
-    Ok(())
+impl Broker {
+    /// Starts a UDP transport on `address`, so peers can join this broker's bus
+    /// over UDP alongside its TCP and WebSocket peers, sharing one subscription
+    /// table.
+    ///
+    /// UDP peers speak the reliability protocol: control frames and
+    /// reliably-published messages are retransmitted until acknowledged and
+    /// delivered in order, while unreliable publishes are best-effort. This is
+    /// the transport substrate for latency-sensitive networking; see
+    /// [NETWORKING.md](https://github.com/matthewjberger/hearsay/blob/main/docs/NETWORKING.md).
+    /// Connect to it with [`crate::UdpClient::connect`].
+    pub async fn start_udp_listener(&self, address: &str) -> Result<()> {
+        let socket = Arc::new(UdpSocket::bind(resolve_address(address).await?).await?);
+        let (outbound_sender, outbound_receiver) = mpsc::channel(OUTBOUND_CAPACITY);
+        tokio::spawn(udp_listen_loop(
+            socket,
+            self.sender.clone(),
+            outbound_sender,
+            outbound_receiver,
+            self.shutdown_sender.subscribe(),
+        ));
+        Ok(())
+    }
 }
 
 struct UdpPeer {
@@ -161,9 +164,6 @@ async fn receive_datagram(
     for frame in delivered {
         let mut frame_buffer = BytesMut::with_capacity(frame.len());
         frame_buffer.extend_from_slice(&frame);
-        // A registered peer keeps its identity; process_incoming_frame drives
-        // the Hello handshake and forwards data frames to the broker exactly as
-        // for a stream peer.
         let alive = process_incoming_frame(
             frame_buffer,
             event_sender,

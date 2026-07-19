@@ -2,9 +2,8 @@
 
 use futures_util::{SinkExt, StreamExt};
 use hearsay::{
-    Bytes, ClientSettings, Route, connect, create_client, decode_message, encode_hello,
-    encode_publish_text, encode_subscribe, next_message, publish, start_broker,
-    start_websocket_listener, subscribe,
+    Broker, Bytes, Client, ClientSettings, Route, decode_message, encode_hello,
+    encode_publish_text, encode_subscribe,
 };
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -28,18 +27,18 @@ async fn send_frame(websocket: &mut WebSocket, frame: Bytes) -> hearsay::Result<
 async fn websocket_and_tcp_peers_interoperate() -> hearsay::Result<()> {
     let broker_address = "127.0.0.1:9939";
     let websocket_address = "127.0.0.1:9940";
-    let broker = start_broker(broker_address).await?;
-    start_websocket_listener(&broker, websocket_address).await?;
+    let broker = Broker::start(broker_address).await?;
+    broker.start_websocket_listener(websocket_address).await?;
 
-    let tcp_client = create_client(
+    let tcp_client = Client::new(
         "tcp_peer",
         ClientSettings {
             autoreconnect: false,
             ..Default::default()
         },
     );
-    connect(&tcp_client, broker_address).await?;
-    subscribe(&tcp_client, &["from/websocket"]).await?;
+    tcp_client.connect(broker_address).await?;
+    tcp_client.subscribe(&["from/websocket"]).await?;
 
     let (mut websocket, _response) =
         tokio_tungstenite::connect_async(format!("ws://{websocket_address}")).await?;
@@ -57,14 +56,16 @@ async fn websocket_and_tcp_peers_interoperate() -> hearsay::Result<()> {
     )
     .await?;
 
-    let message = tokio::time::timeout(Duration::from_secs(5), next_message(&tcp_client))
+    let message = tokio::time::timeout(Duration::from_secs(5), tcp_client.next_message())
         .await?
         .expect("expected a message from the websocket peer");
     assert_eq!(message.topic(), "from/websocket");
     let received: TestPayload = serde_json::from_str(message.text().unwrap())?;
     assert_eq!(received, payload);
 
-    publish(&tcp_client, "from/tcp", &payload, Route::Global).await?;
+    tcp_client
+        .publish("from/tcp", &payload, Route::Global)
+        .await?;
 
     let message = tokio::time::timeout(Duration::from_secs(5), async {
         loop {

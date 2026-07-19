@@ -13,7 +13,10 @@ use socket2::TcpKeepalive;
 use std::{
     collections::HashSet,
     net::SocketAddr,
-    sync::{Arc, Weak},
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::{
@@ -29,25 +32,42 @@ use tokio::{
 
 const RECONNECTION_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_RECONNECTION_BACKOFF: Duration = Duration::from_secs(30);
+const RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const INBOUND_QUEUE_CAPACITY: usize = 1024;
 const OUTBOUND_QUEUE_CAPACITY: usize = 1024;
 
+/// How a [`Client`] establishes and maintains its connection to a broker.
+///
+/// The defaults are tuned for a long-lived client that expects the broker to be
+/// available and wants to ride out transient outages: a bounded number of
+/// initial attempts, then automatic background reconnection with exponential
+/// backoff.
 #[derive(Debug, Clone)]
 pub struct ClientSettings {
     /// Number of additional connection attempts after the first failure before
-    /// [`connect`] gives up. `Some(0)` makes a single attempt; `Some(n)` retries
-    /// up to `n` more times; `None` retries forever, so `connect` will not return
-    /// until a broker is reachable.
+    /// [`Client::connect`] gives up. `Some(0)` makes a single attempt; `Some(n)`
+    /// retries up to `n` more times; `None` retries forever, so `connect` will
+    /// not return until a broker is reachable.
+    ///
+    /// With `autoreconnect` enabled (the default) a small value is usually
+    /// right: `connect` returning an error does not mean the client gives up,
+    /// because the background reconnection task keeps trying regardless.
     pub max_connection_attempts: Option<u16>,
+    /// Whether the client reconnects on its own after the connection drops,
+    /// re-sending its subscriptions each time. Enabled by default.
     pub autoreconnect: bool,
+    /// How long a single connection attempt may take before it is abandoned and
+    /// retried.
     pub timeout_per_attempt: Duration,
+    /// If set, the read half is torn down when no frame arrives within this
+    /// window, which surfaces a silently dead connection as a disconnect.
     pub read_timeout: Option<Duration>,
 }
 
 impl Default for ClientSettings {
     fn default() -> Self {
         Self {
-            max_connection_attempts: Some(100),
+            max_connection_attempts: Some(10),
             autoreconnect: true,
             timeout_per_attempt: Duration::from_secs(2),
             read_timeout: None,
@@ -55,6 +75,13 @@ impl Default for ClientSettings {
     }
 }
 
+/// A connection to a broker over which messages are published and received.
+///
+/// A `Client` is a cheap, reference-counted handle: cloning it shares one
+/// underlying connection, and every method takes `&self`, so the same client
+/// can be shared freely across tasks. Create one with [`Client::new`], connect
+/// it with [`Client::connect`], then [`Client::publish`],
+/// [`Client::subscribe`], and [`Client::next_message`].
 #[derive(Clone)]
 pub struct Client {
     shared: Arc<ClientShared>,
@@ -64,12 +91,19 @@ struct ClientShared {
     id: Box<str>,
     settings: ClientSettings,
     connection: ArcSwapOption<Connection>,
-    receiver: Mutex<Option<Receiver<Message>>>,
     cold: Mutex<ColdState>,
 }
 
 struct Connection {
     outbound: Sender<Frame>,
+    inbound: Mutex<Receiver<Message>>,
+    alive: Arc<AtomicBool>,
+}
+
+impl Connection {
+    fn is_live(&self) -> bool {
+        self.alive.load(Ordering::Acquire) && !self.outbound.is_closed()
+    }
 }
 
 struct ColdState {
@@ -79,231 +113,321 @@ struct ColdState {
     reconnection_task_spawned: bool,
 }
 
-pub fn create_client(name: &str, settings: ClientSettings) -> Client {
-    create_client_with_id(format!("{name}_{}", uuid::Uuid::new_v4()), settings)
-}
+impl Client {
+    /// Creates a client identified by `name`. A random suffix is appended so
+    /// two clients created with the same name still get distinct broker-side
+    /// identities; use [`Client::id`] to read the full identity.
+    pub fn new(name: &str, settings: ClientSettings) -> Client {
+        Self::with_id(format!("{name}_{}", uuid::Uuid::new_v4()), settings)
+    }
 
-pub(crate) fn create_client_with_id(id: String, settings: ClientSettings) -> Client {
-    Client {
-        shared: Arc::new(ClientShared {
-            id: id.into(),
-            settings,
-            connection: ArcSwapOption::empty(),
-            receiver: Mutex::new(None),
-            cold: Mutex::new(ColdState {
-                subscriptions: HashSet::new(),
-                pending_subscriptions: HashSet::new(),
-                broker_address: None,
-                reconnection_task_spawned: false,
+    pub(crate) fn with_id(id: String, settings: ClientSettings) -> Client {
+        Client {
+            shared: Arc::new(ClientShared {
+                id: id.into(),
+                settings,
+                connection: ArcSwapOption::empty(),
+                cold: Mutex::new(ColdState {
+                    subscriptions: HashSet::new(),
+                    pending_subscriptions: HashSet::new(),
+                    broker_address: None,
+                    reconnection_task_spawned: false,
+                }),
             }),
-        }),
-    }
-}
-
-pub fn client_id(client: &Client) -> &str {
-    &client.shared.id
-}
-
-pub async fn is_connected(client: &Client) -> bool {
-    let Some(connection) = client.shared.connection.load_full() else {
-        return false;
-    };
-    if connection.outbound.is_closed() {
-        return false;
-    }
-    let receiver_guard = client.shared.receiver.lock().await;
-    receiver_guard
-        .as_ref()
-        .is_some_and(|receiver| !receiver.is_closed())
-}
-
-pub async fn subscriptions(client: &Client) -> HashSet<String> {
-    client.shared.cold.lock().await.subscriptions.clone()
-}
-
-/// Connects to a broker. With `autoreconnect` enabled the client also
-/// re-establishes the connection if it later drops and re-sends its
-/// subscriptions, but it does not replay messages published to those topics
-/// while it was disconnected; any such messages are lost.
-pub async fn connect(client: &Client, address: &str) -> Result<()> {
-    client.shared.cold.lock().await.broker_address = Some(address.to_string());
-    establish_connection(&client.shared, address).await?;
-    if client.shared.settings.autoreconnect {
-        let mut cold = client.shared.cold.lock().await;
-        if !cold.reconnection_task_spawned {
-            cold.reconnection_task_spawned = true;
-            tokio::spawn(reconnection_task(Arc::downgrade(&client.shared)));
         }
     }
-    Ok(())
-}
 
-pub async fn publish(
-    client: &Client,
-    topic: impl AsRef<str>,
-    payload: &impl Serialize,
-    route: Route,
-) -> Result<()> {
-    let mut buffer = begin_publish_frame(topic.as_ref(), route_flags(route == Route::Local))?;
-    serde_json::to_writer((&mut buffer).writer(), payload)?;
-    let frame = finish_frame(buffer)?;
-    send_frame(&client.shared, Frame::single(frame)).await
-}
+    /// The client's full broker-side identity, including the random suffix
+    /// added by [`Client::new`]. Two clients that register the same identity
+    /// displace each other at the broker, so identities should be unique.
+    pub fn id(&self) -> &str {
+        &self.shared.id
+    }
 
-pub async fn publish_json(
-    client: &Client,
-    topic: impl AsRef<str>,
-    payload: &str,
-    route: Route,
-) -> Result<()> {
-    let mut buffer = begin_publish_frame(topic.as_ref(), route_flags(route == Route::Local))?;
-    buffer.put_slice(payload.as_bytes());
-    let frame = finish_frame(buffer)?;
-    send_frame(&client.shared, Frame::single(frame)).await
-}
+    /// Whether the client currently holds a live connection to the broker.
+    ///
+    /// This reflects the transport, not the presence of pending messages: a
+    /// connected client with an empty queue still returns `true`.
+    pub async fn is_connected(&self) -> bool {
+        self.shared
+            .connection
+            .load_full()
+            .is_some_and(|connection| connection.is_live())
+    }
 
-pub async fn publish_bytes(
-    client: &Client,
-    topic: impl AsRef<str>,
-    payload: &[u8],
-    route: Route,
-) -> Result<()> {
-    let mut buffer = begin_publish_frame(
-        topic.as_ref(),
-        FLAG_BINARY | route_flags(route == Route::Local),
-    )?;
-    buffer.put_slice(payload);
-    let frame = finish_frame(buffer)?;
-    send_frame(&client.shared, Frame::single(frame)).await
-}
+    /// The set of topics the client is currently subscribed to, including any
+    /// subscriptions still pending because the client is not yet connected.
+    pub async fn subscriptions(&self) -> HashSet<String> {
+        let cold = self.shared.cold.lock().await;
+        cold.subscriptions
+            .iter()
+            .chain(cold.pending_subscriptions.iter())
+            .cloned()
+            .collect()
+    }
 
-pub async fn subscribe(client: &Client, topics: &[impl AsRef<str>]) -> Result<()> {
-    for topic in topics {
-        let topic = topic.as_ref();
-        {
-            let mut cold = client.shared.cold.lock().await;
-            if client.shared.connection.load_full().is_none() {
-                cold.pending_subscriptions.insert(topic.to_string());
-                continue;
+    /// Connects to a broker at `address`.
+    ///
+    /// With `autoreconnect` enabled the client also re-establishes the
+    /// connection if it later drops and re-sends its subscriptions, but it does
+    /// not replay messages published to those topics while it was disconnected;
+    /// any such messages are lost. `address` accepts a host:port pair and is
+    /// resolved fresh on every attempt, so a broker that moves to a new address
+    /// behind the same name is reconnected to automatically.
+    pub async fn connect(&self, address: &str) -> Result<()> {
+        self.shared.cold.lock().await.broker_address = Some(address.to_string());
+        establish_connection(&self.shared, address).await?;
+        if self.shared.settings.autoreconnect {
+            let mut cold = self.shared.cold.lock().await;
+            if !cold.reconnection_task_spawned {
+                cold.reconnection_task_spawned = true;
+                tokio::spawn(reconnection_task(Arc::downgrade(&self.shared)));
             }
         }
-        let frame = Frame::single(encode_subscribe(topic)?);
-        if let Err(error) = send_frame(&client.shared, frame).await {
-            client
-                .shared
+        Ok(())
+    }
+
+    /// Publishes `payload` to `topic`, serialized as JSON.
+    ///
+    /// This is the typed path that pairs with contract topic accessors and is
+    /// the format browser and WASM peers read most easily. For a compact binary
+    /// encoding of the same typed value use [`Client::publish_postcard`]; for a
+    /// value already encoded as bytes use [`Client::publish_bytes`].
+    ///
+    /// Delivery is best-effort: a subscriber that is disconnected or too far
+    /// behind may never see the message. `route` selects whether the message
+    /// crosses broker bridges ([`Route::Global`]) or stays on the local broker
+    /// ([`Route::Local`]).
+    pub async fn publish(
+        &self,
+        topic: impl AsRef<str>,
+        payload: &impl Serialize,
+        route: Route,
+    ) -> Result<()> {
+        let mut buffer = begin_publish_frame(topic.as_ref(), route_flags(route == Route::Local))?;
+        serde_json::to_writer((&mut buffer).writer(), payload)?;
+        let frame = finish_frame(buffer)?;
+        self.send_frame(Frame::single(frame)).await
+    }
+
+    /// Publishes an already-serialized JSON string to `topic`, skipping the
+    /// serialization step of [`Client::publish`].
+    pub async fn publish_json(
+        &self,
+        topic: impl AsRef<str>,
+        payload: &str,
+        route: Route,
+    ) -> Result<()> {
+        let mut buffer = begin_publish_frame(topic.as_ref(), route_flags(route == Route::Local))?;
+        buffer.put_slice(payload.as_bytes());
+        let frame = finish_frame(buffer)?;
+        self.send_frame(Frame::single(frame)).await
+    }
+
+    /// Publishes `payload` to `topic`, serialized with [postcard] into a compact
+    /// binary frame.
+    ///
+    /// This is the typed binary path: it carries the same strongly-typed values
+    /// as [`Client::publish`] but without the size and encoding cost of JSON,
+    /// which makes it the better default for high-frequency native-to-native
+    /// traffic. Subscribers decode it with [`Message::read`].
+    ///
+    /// [postcard]: https://docs.rs/postcard
+    pub async fn publish_postcard(
+        &self,
+        topic: impl AsRef<str>,
+        payload: &impl Serialize,
+        route: Route,
+    ) -> Result<()> {
+        let bytes = postcard::to_allocvec(payload)?;
+        self.publish_bytes(topic, &bytes, route).await
+    }
+
+    /// Publishes raw bytes to `topic` as a binary message, with no
+    /// serialization applied. Subscribers read them back with [`Message::bytes`].
+    pub async fn publish_bytes(
+        &self,
+        topic: impl AsRef<str>,
+        payload: &[u8],
+        route: Route,
+    ) -> Result<()> {
+        let mut buffer = begin_publish_frame(
+            topic.as_ref(),
+            FLAG_BINARY | route_flags(route == Route::Local),
+        )?;
+        buffer.put_slice(payload);
+        let frame = finish_frame(buffer)?;
+        self.send_frame(Frame::single(frame)).await
+    }
+
+    pub(crate) async fn publish_encoded(
+        &self,
+        topic: &str,
+        payload: &[u8],
+        binary: bool,
+        route: Route,
+    ) -> Result<()> {
+        let flags = if binary { FLAG_BINARY } else { 0 } | route_flags(route == Route::Local);
+        let mut buffer = begin_publish_frame(topic, flags)?;
+        buffer.put_slice(payload);
+        let frame = finish_frame(buffer)?;
+        self.send_frame(Frame::single(frame)).await
+    }
+
+    /// Subscribes to each of `topics`.
+    ///
+    /// A topic may be a literal name or an MQTT-style pattern: a `+` segment
+    /// matches exactly one topic level and a trailing `#` matches the remaining
+    /// levels, so `sensors/+/temperature` and `sensors/#` both select many
+    /// concrete topics. Subscriptions requested before the client is connected
+    /// are remembered and applied on connect, and re-sent automatically after a
+    /// reconnect.
+    pub async fn subscribe(&self, topics: &[impl AsRef<str>]) -> Result<()> {
+        for topic in topics {
+            let topic = topic.as_ref();
+            {
+                let mut cold = self.shared.cold.lock().await;
+                if self.shared.connection.load_full().is_none() {
+                    cold.pending_subscriptions.insert(topic.to_string());
+                    continue;
+                }
+            }
+            let frame = Frame::single(encode_subscribe(topic)?);
+            if let Err(error) = self.send_frame(frame).await {
+                self.shared
+                    .cold
+                    .lock()
+                    .await
+                    .pending_subscriptions
+                    .insert(topic.to_string());
+                return Err(error);
+            }
+            self.shared
                 .cold
                 .lock()
                 .await
-                .pending_subscriptions
+                .subscriptions
                 .insert(topic.to_string());
-            return Err(error);
         }
-        client
-            .shared
-            .cold
-            .lock()
-            .await
-            .subscriptions
-            .insert(topic.to_string());
+        Ok(())
     }
-    Ok(())
-}
 
-pub async fn unsubscribe(client: &Client, topics: &[impl AsRef<str>]) -> Result<()> {
-    for topic in topics {
-        let topic = topic.as_ref();
-        let connected = {
-            let mut cold = client.shared.cold.lock().await;
-            cold.pending_subscriptions.remove(topic);
-            cold.subscriptions.remove(topic);
-            client.shared.connection.load_full().is_some()
+    /// Unsubscribes from each of `topics`, cancelling both active and
+    /// not-yet-applied subscriptions so a topic dropped while offline does not
+    /// silently return on the next reconnect.
+    pub async fn unsubscribe(&self, topics: &[impl AsRef<str>]) -> Result<()> {
+        for topic in topics {
+            let topic = topic.as_ref();
+            let connected = {
+                let mut cold = self.shared.cold.lock().await;
+                cold.pending_subscriptions.remove(topic);
+                cold.subscriptions.remove(topic);
+                self.shared.connection.load_full().is_some()
+            };
+            if connected {
+                self.send_frame(Frame::single(encode_unsubscribe(topic)?))
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns the next message without waiting.
+    ///
+    /// Unlike [`Client::next_message`] this never blocks: it reports
+    /// [`Reception::Empty`] when the queue is momentarily empty and
+    /// [`Reception::Disconnected`] when the connection has dropped, letting a
+    /// polling loop distinguish "nothing yet" from "nothing ever again".
+    pub async fn try_next_message(&self) -> Reception {
+        let Some(connection) = self.shared.connection.load_full() else {
+            return Reception::Disconnected;
         };
-        if connected {
-            send_frame(&client.shared, Frame::single(encode_unsubscribe(topic)?)).await?;
+        let mut receiver = connection.inbound.lock().await;
+        match receiver.try_recv() {
+            Ok(message) => Reception::Message(message),
+            Err(TryRecvError::Disconnected) => {
+                connection.alive.store(false, Ordering::Release);
+                Reception::Disconnected
+            }
+            Err(TryRecvError::Empty) => Reception::Empty,
         }
     }
-    Ok(())
+
+    /// Waits for and returns the next message, or `None` once the connection has
+    /// dropped and its queue is drained.
+    ///
+    /// When `autoreconnect` is enabled a `None` here does not mean the client is
+    /// finished: after the background task reconnects, calling this again yields
+    /// messages from the new connection. A returned `None` therefore marks the
+    /// end of one connection's stream, not the end of the client.
+    pub async fn next_message(&self) -> Option<Message> {
+        let connection = self.shared.connection.load_full()?;
+        let mut receiver = connection.inbound.lock().await;
+        match receiver.recv().await {
+            Some(message) => Some(message),
+            None => {
+                connection.alive.store(false, Ordering::Release);
+                None
+            }
+        }
+    }
+
+    /// Asks the broker to open a bridge from `source_address` to
+    /// `target_address`, joining the two brokers' buses so globally-routed
+    /// messages flow between them.
+    pub async fn open_bridge(&self, source_address: &str, target_address: &str) -> Result<()> {
+        self.open_bridge_acked(source_address, target_address, false)
+            .await
+    }
+
+    pub(crate) async fn open_bridge_acked(
+        &self,
+        source_address: &str,
+        target_address: &str,
+        ack: bool,
+    ) -> Result<()> {
+        let frame = encode_open_bridge(ack, source_address, target_address)?;
+        self.send_frame(Frame::single(frame)).await
+    }
+
+    /// Asks the broker to close the bridge to `target_address`.
+    pub async fn close_bridge(&self, target_address: &str) -> Result<()> {
+        let frame = encode_close_bridge(false, target_address)?;
+        self.send_frame(Frame::single(frame)).await
+    }
+
+    pub(crate) async fn notify_close_bridge(&self) -> Result<()> {
+        let frame = encode_close_bridge(true, "")?;
+        self.send_frame(Frame::single(frame)).await
+    }
+
+    pub(crate) async fn send_bridge_frame(&self, frame: Frame) -> Result<()> {
+        self.send_frame(frame).await
+    }
+
+    async fn send_frame(&self, frame: Frame) -> Result<()> {
+        let Some(connection) = self.shared.connection.load_full() else {
+            return Err(Error::NotConnected);
+        };
+        if connection.outbound.send(frame).await.is_err() {
+            return Err(Error::NotConnected);
+        }
+        Ok(())
+    }
 }
 
-/// Result of a non-blocking [`try_next_message`]: a message is available, the
-/// queue is currently empty but the client is still connected, or the client
-/// has disconnected and no further messages will arrive until reconnection.
+/// The outcome of a non-blocking [`Client::try_next_message`]: a message is
+/// available, the queue is empty but the client is still connected, or the
+/// client has disconnected and no further messages arrive until it reconnects.
 #[derive(Debug)]
 pub enum Reception {
+    /// A message was waiting and is returned.
     Message(Message),
+    /// The queue is currently empty; the client is still connected.
     Empty,
+    /// The connection has dropped; the queue will not produce more messages
+    /// until the client reconnects.
     Disconnected,
-}
-
-pub async fn try_next_message(client: &Client) -> Reception {
-    let mut receiver_guard = client.shared.receiver.lock().await;
-    let Some(receiver) = receiver_guard.as_mut() else {
-        return Reception::Disconnected;
-    };
-    match receiver.try_recv() {
-        Ok(message) => Reception::Message(message),
-        Err(TryRecvError::Disconnected) => {
-            *receiver_guard = None;
-            client.shared.connection.store(None);
-            Reception::Disconnected
-        }
-        Err(TryRecvError::Empty) => Reception::Empty,
-    }
-}
-
-pub async fn next_message(client: &Client) -> Option<Message> {
-    let mut receiver_guard = client.shared.receiver.lock().await;
-    let receiver = receiver_guard.as_mut()?;
-    match receiver.recv().await {
-        Some(message) => Some(message),
-        None => {
-            *receiver_guard = None;
-            client.shared.connection.store(None);
-            None
-        }
-    }
-}
-
-pub async fn open_bridge(
-    client: &Client,
-    source_address: &str,
-    target_address: &str,
-) -> Result<()> {
-    open_bridge_acked(client, source_address, target_address, false).await
-}
-
-pub(crate) async fn open_bridge_acked(
-    client: &Client,
-    source_address: &str,
-    target_address: &str,
-    ack: bool,
-) -> Result<()> {
-    let frame = encode_open_bridge(ack, source_address, target_address)?;
-    send_frame(&client.shared, Frame::single(frame)).await
-}
-
-pub async fn close_bridge(client: &Client, target_address: &str) -> Result<()> {
-    let frame = encode_close_bridge(false, target_address)?;
-    send_frame(&client.shared, Frame::single(frame)).await
-}
-
-pub(crate) async fn notify_close_bridge(client: &Client) -> Result<()> {
-    let frame = encode_close_bridge(true, "")?;
-    send_frame(&client.shared, Frame::single(frame)).await
-}
-
-pub(crate) async fn send_bridge_frame(client: &Client, frame: Frame) -> Result<()> {
-    send_frame(&client.shared, frame).await
-}
-
-async fn send_frame(shared: &ClientShared, frame: Frame) -> Result<()> {
-    let Some(connection) = shared.connection.load_full() else {
-        return Err(Error::NotConnected);
-    };
-    if connection.outbound.send(frame).await.is_err() {
-        return Err(Error::NotConnected);
-    }
-    Ok(())
 }
 
 async fn establish_connection(shared: &Arc<ClientShared>, address: &str) -> Result<()> {
@@ -316,18 +440,31 @@ async fn establish_connection(shared: &Arc<ClientShared>, address: &str) -> Resu
     let (read_half, write_half) = stream.into_split();
     let (message_sender, message_receiver) = mpsc::channel(INBOUND_QUEUE_CAPACITY);
     let (outbound_sender, outbound_receiver) = mpsc::channel(OUTBOUND_QUEUE_CAPACITY);
-    tokio::spawn(writer_task(write_half, outbound_receiver));
+    let alive = Arc::new(AtomicBool::new(true));
+    tokio::spawn(writer_task(write_half, outbound_receiver, alive.clone()));
     tokio::spawn(read_task(
         read_half,
         message_sender,
         shared.settings.read_timeout,
+        alive.clone(),
     ));
-    *shared.receiver.lock().await = Some(message_receiver);
     shared.connection.store(Some(Arc::new(Connection {
         outbound: outbound_sender,
+        inbound: Mutex::new(message_receiver),
+        alive,
     })));
-    send_frame(shared, Frame::single(encode_hello(&shared.id)?)).await?;
+    send_frame_on(shared, Frame::single(encode_hello(&shared.id)?)).await?;
     resubscribe(shared).await?;
+    Ok(())
+}
+
+async fn send_frame_on(shared: &Arc<ClientShared>, frame: Frame) -> Result<()> {
+    let Some(connection) = shared.connection.load_full() else {
+        return Err(Error::NotConnected);
+    };
+    if connection.outbound.send(frame).await.is_err() {
+        return Err(Error::NotConnected);
+    }
     Ok(())
 }
 
@@ -341,7 +478,7 @@ async fn reconnection_task(shared: Weak<ClientShared>) {
         let connected = shared
             .connection
             .load_full()
-            .is_some_and(|connection| !connection.outbound.is_closed());
+            .is_some_and(|connection| connection.is_live());
         if connected {
             backoff = RECONNECTION_INTERVAL;
             continue;
@@ -373,7 +510,7 @@ async fn connect_with_retries(
             return Err(Error::MaxConnectionAttempts);
         }
         attempt += 1;
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(RETRY_INTERVAL).await;
     }
 }
 
@@ -419,6 +556,7 @@ async fn read_task(
     read_half: OwnedReadHalf,
     message_sender: Sender<Message>,
     read_timeout: Option<Duration>,
+    alive: Arc<AtomicBool>,
 ) {
     let mut reader = FrameReader::new(read_half);
     loop {
@@ -439,9 +577,14 @@ async fn read_task(
             break;
         }
     }
+    alive.store(false, Ordering::Release);
 }
 
-async fn writer_task(mut write_half: OwnedWriteHalf, mut outbound: Receiver<Frame>) {
+async fn writer_task(
+    mut write_half: OwnedWriteHalf,
+    mut outbound: Receiver<Frame>,
+    alive: Arc<AtomicBool>,
+) {
     let mut frames: Vec<Frame> = Vec::with_capacity(MAX_WRITE_BATCH);
     while let Some(frame) = outbound.recv().await {
         frames.clear();
@@ -455,6 +598,7 @@ async fn writer_task(mut write_half: OwnedWriteHalf, mut outbound: Receiver<Fram
             break;
         }
     }
+    alive.store(false, Ordering::Release);
 }
 
 async fn resubscribe(shared: &Arc<ClientShared>) -> Result<()> {
@@ -467,7 +611,7 @@ async fn resubscribe(shared: &Arc<ClientShared>) -> Result<()> {
             .collect()
     };
     for topic in topics {
-        send_frame(shared, Frame::single(encode_subscribe(&topic)?)).await?;
+        send_frame_on(shared, Frame::single(encode_subscribe(&topic)?)).await?;
         let mut cold = shared.cold.lock().await;
         cold.subscriptions.insert(topic.clone());
         cold.pending_subscriptions.remove(&topic);

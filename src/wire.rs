@@ -1,5 +1,6 @@
 use crate::{Error, Result};
 use bytes::{BufMut, Bytes, BytesMut};
+use serde::de::DeserializeOwned;
 use std::ops::Range;
 
 pub(crate) const MAX_FRAME_LENGTH: usize = 64 * 1024 * 1024;
@@ -47,6 +48,27 @@ impl Message {
         } else {
             None
         }
+    }
+
+    /// Decodes the binary payload as a single [postcard]-encoded value of type
+    /// `T`, the receive half of [`crate::Client::publish_postcard`].
+    ///
+    /// Returns an error if the message carries text rather than binary, or if
+    /// the bytes do not decode into `T`.
+    ///
+    /// [postcard]: https://docs.rs/postcard
+    pub fn read<T: DeserializeOwned>(&self) -> Result<T> {
+        let bytes = self
+            .bytes()
+            .ok_or_else(|| Error::from("message has no binary payload"))?;
+        Ok(postcard::from_bytes(bytes)?)
+    }
+
+    /// Decodes the binary payload as a batch of `T` values, the receive half of
+    /// a [`crate::Batch`] flush. Equivalent to reading a `Vec<T>` with
+    /// [`Message::read`].
+    pub fn read_batch<T: DeserializeOwned>(&self) -> Result<Vec<T>> {
+        self.read()
     }
 }
 
@@ -395,6 +417,16 @@ mod transport {
         finish_frame(buffer)
     }
 
+    pub(crate) fn encode_deliver_binary(topic: &str, payload: &[u8]) -> Result<Bytes> {
+        let mut buffer = BytesMut::with_capacity(HEADER_LENGTH + topic.len() + payload.len());
+        buffer.put_u32(0);
+        buffer.put_u8(KIND_DELIVER);
+        buffer.put_u8(FLAG_BINARY);
+        put_string_field(&mut buffer, topic.as_bytes())?;
+        buffer.put_slice(payload);
+        finish_frame(buffer)
+    }
+
     pub(crate) fn encode_deliver_header(
         topic: &[u8],
         flags: u8,
@@ -521,5 +553,97 @@ mod transport {
             std::io::IoSlice::advance_slices(&mut remaining, written);
         }
         Ok(())
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use proptest::prelude::*;
+
+    const TOPIC_PATTERN: &str = "[a-zA-Z0-9/_+#. -]{0,64}";
+    const TEXT_PATTERN: &str = "[a-zA-Z0-9/_+#. -]{0,256}";
+
+    proptest! {
+        #[test]
+        fn decode_message_never_panics_on_arbitrary_bytes(bytes: Vec<u8>) {
+            let _ = decode_message(Bytes::from(bytes));
+        }
+
+        #[test]
+        fn parse_frame_never_panics_on_arbitrary_bytes(bytes: Vec<u8>) {
+            let _ = parse_frame(&bytes);
+        }
+
+        #[test]
+        fn publish_text_roundtrips(
+            topic in TOPIC_PATTERN,
+            payload in TEXT_PATTERN,
+            local in any::<bool>(),
+        ) {
+            let frame = encode_publish_text(&topic, &payload, local).unwrap();
+            let view = parse_frame(&frame).expect("a freshly built frame parses");
+            let FrameView::Publish { flags, topic: topic_range, payload: payload_range } = view else {
+                return Err(TestCaseError::fail("expected a Publish frame"));
+            };
+            prop_assert_eq!(&frame[topic_range], topic.as_bytes());
+            prop_assert_eq!(&frame[payload_range], payload.as_bytes());
+            prop_assert_eq!(flags & FLAG_LOCAL_ONLY != 0, local);
+            prop_assert_eq!(flags & FLAG_BINARY, 0);
+        }
+
+        #[test]
+        fn publish_binary_roundtrips(
+            topic in TOPIC_PATTERN,
+            payload: Vec<u8>,
+            local in any::<bool>(),
+        ) {
+            let frame = encode_publish_binary(&topic, &payload, local).unwrap();
+            let view = parse_frame(&frame).expect("a freshly built frame parses");
+            let FrameView::Publish { flags, topic: topic_range, payload: payload_range } = view else {
+                return Err(TestCaseError::fail("expected a Publish frame"));
+            };
+            prop_assert_eq!(&frame[topic_range], topic.as_bytes());
+            prop_assert_eq!(&frame[payload_range], payload.as_slice());
+            prop_assert!(flags & FLAG_BINARY != 0);
+        }
+
+        #[test]
+        fn hello_subscribe_unsubscribe_roundtrip(value in TOPIC_PATTERN) {
+            let hello = encode_hello(&value).unwrap();
+            let FrameView::Hello { id } = parse_frame(&hello).unwrap() else {
+                return Err(TestCaseError::fail("expected a Hello frame"));
+            };
+            prop_assert_eq!(&hello[id], value.as_bytes());
+
+            let subscribe = encode_subscribe(&value).unwrap();
+            let FrameView::Subscribe { topic } = parse_frame(&subscribe).unwrap() else {
+                return Err(TestCaseError::fail("expected a Subscribe frame"));
+            };
+            prop_assert_eq!(&subscribe[topic], value.as_bytes());
+
+            let unsubscribe = encode_unsubscribe(&value).unwrap();
+            let FrameView::Unsubscribe { topic } = parse_frame(&unsubscribe).unwrap() else {
+                return Err(TestCaseError::fail("expected an Unsubscribe frame"));
+            };
+            prop_assert_eq!(&unsubscribe[topic], value.as_bytes());
+        }
+
+        #[test]
+        fn deliver_text_decodes_back(topic in TOPIC_PATTERN, payload in TEXT_PATTERN) {
+            let frame = encode_deliver_text(&topic, &payload).unwrap();
+            let message = decode_message(frame).expect("a deliver frame decodes");
+            prop_assert_eq!(message.topic(), topic.as_str());
+            prop_assert_eq!(message.text(), Some(payload.as_str()));
+        }
+
+        #[test]
+        fn deliver_binary_decodes_back(topic in TOPIC_PATTERN, payload: Vec<u8>) {
+            let frame = encode_deliver_binary(&topic, &payload).unwrap();
+            let message = decode_message(frame).expect("a deliver frame decodes");
+            prop_assert_eq!(message.topic(), topic.as_str());
+            prop_assert_eq!(message.bytes(), Some(payload.as_slice()));
+        }
     }
 }

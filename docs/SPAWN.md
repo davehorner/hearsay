@@ -31,13 +31,13 @@ Apps are keyed by `name`. There is no separate id layer.
 
 ## 2. Functions
 
-All take `&Broker`:
+All are methods on `Broker`:
 
-- `spawn_app(&broker, app)` launches the process. Errors if an app with that name is currently running; a previously exited or stopped name is replaced.
-- `stop_app(&broker, name)` kills the process and marks it `Stopped`. Stopped apps are never restarted by supervision.
-- `restart_app(&broker, name)` kills (if running) and relaunches from the stored descriptor.
-- `app_status(&broker, name)` and `app_statuses(&broker)` poll child exit state on demand.
-- `drain_output(&broker)` returns every `OutputLine` captured since the last drain, across all apps and both streams.
+- `broker.spawn_app(app)` launches the process. Errors if an app with that name is currently running; a previously exited or stopped name is replaced.
+- `broker.stop_app(name)` kills the process and marks it `Stopped`. Stopped apps are never restarted by supervision.
+- `broker.restart_app(name)` kills (if running) and relaunches from the stored descriptor.
+- `broker.app_status(name)` and `broker.app_statuses()` poll child exit state on demand.
+- `broker.drain_output()` returns every `OutputLine` captured since the last drain, across all apps and both streams.
 
 ## 3. Launching
 
@@ -79,8 +79,8 @@ The one caveat is inherent to `kill_on_drop`: it runs when destructors run. `std
 The intended shape is a single host process that brings up the broker and its constellation:
 
 ```rust
-let broker = hearsay::start_broker("127.0.0.1:9612").await?;
-hearsay::spawn_app(&broker, hearsay::App {
+let broker = hearsay::Broker::start("127.0.0.1:9612").await?;
+broker.spawn_app(hearsay::App {
     name: "worker".to_string(),
     path: "target/debug/worker".to_string(),
     restart_policy: hearsay::RestartPolicy::OnFailure,

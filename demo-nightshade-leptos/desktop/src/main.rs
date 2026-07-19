@@ -73,10 +73,10 @@ fn start_network(role: ShellRole, shell_id: String) {
         };
         runtime.block_on(async move {
             let (broker, address) = match &role {
-                ShellRole::Host => match hearsay::start_broker(BROKER_ADDRESS).await {
+                ShellRole::Host => match hearsay::Broker::start(BROKER_ADDRESS).await {
                     Ok(broker) => {
                         if let Err(error) =
-                            hearsay::start_websocket_listener(&broker, WEBSOCKET_ADDRESS).await
+                            broker.start_websocket_listener(WEBSOCKET_ADDRESS).await
                         {
                             eprintln!("failed to start the websocket listener: {error}");
                         }
@@ -87,8 +87,8 @@ fn start_network(role: ShellRole, shell_id: String) {
                 ShellRole::Child { broker_address } => (None, broker_address.clone()),
             };
 
-            let mut client = hearsay::create_client("shell", hearsay::ClientSettings::default());
-            if hearsay::connect(&mut client, &address).await.is_err() {
+            let client = hearsay::Client::new("shell", hearsay::ClientSettings::default());
+            if client.connect(&address).await.is_err() {
                 return;
             }
             let close = close_topic(&shell_id);
@@ -96,30 +96,28 @@ fn start_network(role: ShellRole, shell_id: String) {
             if broker.is_some() {
                 topics.push(SPAWN_TOPIC);
             }
-            if hearsay::subscribe(&mut client, &topics).await.is_err() {
+            if client.subscribe(&topics).await.is_err() {
                 return;
             }
 
             let mut window_counter: u32 = 0;
-            while let Some(message) = hearsay::next_message(&mut client).await {
-                if message.topic == close {
+            while let Some(message) = client.next_message().await {
+                if message.topic() == close {
                     std::process::exit(0);
                 }
-                if message.topic == SPAWN_TOPIC
+                if message.topic() == SPAWN_TOPIC
                     && let Some(broker) = &broker
                     && let Ok(executable) = std::env::current_exe()
                 {
                     window_counter += 1;
-                    let _ = hearsay::spawn_app(
-                        broker,
-                        hearsay::App {
+                    let _ = broker
+                        .spawn_app(hearsay::App {
                             name: format!("leptos-window-{window_counter}"),
                             path: executable.display().to_string(),
                             restart_policy: hearsay::RestartPolicy::Never,
                             ..Default::default()
-                        },
-                    )
-                    .await;
+                        })
+                        .await;
                 }
             }
 

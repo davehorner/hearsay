@@ -1,7 +1,4 @@
-use crate::{
-    Client, ClientSettings, client_id, connect, create_client, create_client_with_id, is_connected,
-    notify_close_bridge, send_bridge_frame, wire::Frame,
-};
+use crate::{Client, ClientSettings, wire::Frame};
 use std::time::Duration;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 
@@ -83,11 +80,11 @@ pub(crate) async fn connect_bridge(
         ..Default::default()
     };
     let client = match override_id {
-        Some(id) => create_client_with_id(id, settings),
-        None => create_client("bridge", settings),
+        Some(id) => Client::with_id(id, settings),
+        None => Client::new("bridge", settings),
     };
-    let id = client_id(&client).to_string();
-    if connect(&client, target_address).await.is_err() {
+    let id = client.id().to_string();
+    if client.connect(target_address).await.is_err() {
         return None;
     }
     Some((client, id))
@@ -109,17 +106,17 @@ async fn bridge_task(
         tokio::select! {
             command = commands.recv() => match command {
                 Some(BridgeCommand::Forward(frame)) => {
-                    let _ = send_bridge_frame(&client, frame).await;
+                    let _ = client.send_bridge_frame(frame).await;
                 }
                 Some(BridgeCommand::CloseAndNotify) => {
-                    let _ = notify_close_bridge(&client).await;
+                    let _ = client.notify_close_bridge().await;
                     break;
                 }
                 Some(BridgeCommand::CloseLocal) | None => break,
             },
             _ = reconnect.tick() => {
-                if !is_connected(&client).await {
-                    let _ = connect(&client, &target_address).await;
+                if !client.is_connected().await {
+                    let _ = client.connect(&target_address).await;
                 }
             }
         }

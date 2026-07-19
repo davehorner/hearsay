@@ -6,7 +6,7 @@ The demo is a desktop dashboard shell built on Bevy, bevy_egui, egui_tiles, and 
 
 `WindowRole::detect` decides what a process is at startup: if the `HEARSAY_BROKER` environment variable is present the process is a `Child` and connects to that address, otherwise it is the `Primary` and hosts the broker on `127.0.0.1:9612` before connecting its own client to it.
 
-"New Window" on the primary sends `BrokerServiceMessage::SpawnWindow`, which calls `hearsay::spawn_app` with the current executable. The broker supervises the child, injects `HEARSAY_BROKER`, and kills it when the broker is dropped. A child window's "New Window" publishes `shell/window/request-spawn`, which the primary handles by spawning. If a child loses its broker connection, it exits, so killing the primary tears down every window through either path: graceful shutdown drops the broker and kills supervised children, and a hard kill severs their connections.
+"New Window" on the primary sends `BrokerServiceMessage::SpawnWindow`, which calls `broker.spawn_app` with the current executable. The broker supervises the child, injects `HEARSAY_BROKER`, and kills it when the broker is dropped. A child window's "New Window" publishes `shell/window/request-spawn`, which the primary handles by spawning. If a child loses its broker connection, it exits, so killing the primary tears down every window through either path: graceful shutdown drops the broker and kills supervised children, and a hard kill severs their connections.
 
 ## Broker runtime (`services/broker.rs`)
 
@@ -15,7 +15,7 @@ Bevy systems are synchronous and hearsay is async, so the broker lives on a dedi
 - `RuntimeCommand`: Publish, PublishBytes, Subscribe, Unsubscribe, SpawnWindow
 - `RuntimeEvent`: Connected, Disconnected, Failed, Inbound
 
-The runtime loop selects between draining commands and `hearsay::next_message`. On disconnect it falls back to polling `hearsay::is_connected` (the hearsay client auto-reconnects and re-subscribes on its own) and emits Connected when the link returns.
+The runtime loop selects between draining commands and `client.next_message()`. On disconnect it falls back to polling `client.is_connected()` (the hearsay client auto-reconnects and re-subscribes on its own) and emits Connected when the link returns.
 
 `SubscriptionRegistry` reference-counts topics by widget id on the Bevy side: subscribes always forward to the broker, but a topic is only unsubscribed when its last widget leaves. `WidgetRemoved` sweeps all of a closed widget's topics.
 

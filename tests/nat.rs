@@ -1,6 +1,6 @@
 #![cfg(feature = "nat")]
 
-use hearsay::{punch, start_rendezvous};
+use hearsay::{Rendezvous, punch};
 use std::time::Duration;
 use tokio::net::UdpSocket;
 
@@ -19,7 +19,7 @@ async fn recv_nonempty(socket: &UdpSocket) -> Vec<u8> {
 // other's observed address, and once they do they exchange datagrams directly.
 #[tokio::test(flavor = "multi_thread")]
 async fn peers_meet_through_the_rendezvous_and_exchange_directly() -> hearsay::Result<()> {
-    let rendezvous = start_rendezvous("127.0.0.1:0").await?;
+    let rendezvous = Rendezvous::start("127.0.0.1:0").await?;
     let rendezvous_address = rendezvous.address();
 
     let alice = UdpSocket::bind("127.0.0.1:0").await?;

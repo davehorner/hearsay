@@ -7,10 +7,7 @@
 //! teleport or move faster than the rules allow by lying about its position —
 //! it never sends one. Chat is exchanged reliably in both directions.
 
-use hearsay::{
-    Delivery, create_udp_client, next_udp_message, start_broker, start_udp_listener, udp_publish,
-    udp_subscribe,
-};
+use hearsay::{Broker, Delivery, UdpClient};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -110,9 +107,9 @@ async fn network_main(
     to_game: UnboundedSender<NetEvent>,
 ) {
     let _broker = if is_host {
-        match start_broker(BROKER_TCP_BIND).await {
+        match Broker::start(BROKER_TCP_BIND).await {
             Ok(broker) => {
-                let _ = start_udp_listener(&broker, UDP_LISTEN_BIND).await;
+                let _ = broker.start_udp_listener(UDP_LISTEN_BIND).await;
                 Some(broker)
             }
             Err(_) => None,
@@ -122,7 +119,7 @@ async fn network_main(
     };
 
     let client = loop {
-        match create_udp_client(&format!("player{my_id}"), &connect_address).await {
+        match UdpClient::connect(&format!("player{my_id}"), &connect_address).await {
             Ok(client) => break client,
             Err(_) => tokio::time::sleep(Duration::from_millis(500)).await,
         }
@@ -130,9 +127,9 @@ async fn network_main(
 
     // The host consumes guest input; everyone consumes authoritative state and chat.
     if is_host {
-        let _ = udp_subscribe(&client, &[INPUT_TOPIC, STATE_TOPIC, CHAT_TOPIC]).await;
+        let _ = client.subscribe(&[INPUT_TOPIC, STATE_TOPIC, CHAT_TOPIC]).await;
     } else {
-        let _ = udp_subscribe(&client, &[STATE_TOPIC, CHAT_TOPIC]).await;
+        let _ = client.subscribe(&[STATE_TOPIC, CHAT_TOPIC]).await;
     }
 
     loop {
@@ -144,19 +141,19 @@ async fn network_main(
                 match command {
                     NetCommand::Input(direction) => {
                         let message = InputMessage { id: my_id, direction };
-                        let _ = udp_publish(&client, INPUT_TOPIC, &message, Delivery::Unreliable).await;
+                        let _ = client.publish(INPUT_TOPIC, &message, Delivery::Unreliable).await;
                     }
                     NetCommand::State { id, position } => {
                         let message = StateMessage { id, position };
-                        let _ = udp_publish(&client, STATE_TOPIC, &message, Delivery::Unreliable).await;
+                        let _ = client.publish(STATE_TOPIC, &message, Delivery::Unreliable).await;
                     }
                     NetCommand::Chat(text) => {
                         let message = ChatMessage { id: my_id, text };
-                        let _ = udp_publish(&client, CHAT_TOPIC, &message, Delivery::ReliableOrdered).await;
+                        let _ = client.publish(CHAT_TOPIC, &message, Delivery::ReliableOrdered).await;
                     }
                 }
             }
-            message = next_udp_message(&client) => {
+            message = client.next_message() => {
                 let Some(message) = message else {
                     break;
                 };

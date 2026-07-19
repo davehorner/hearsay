@@ -21,24 +21,24 @@ pub struct Batch<T> {
 }
 ```
 
-All fields are public; the struct is plain data owned by the caller.
+All fields are public; the struct is plain data owned by the caller. The verbs are methods on the batch that borrow the client:
 
-- `create_batch(topic, route, max_items, flush_interval) -> Batch<T>`
-- `push_to_batch(client, &mut batch, item)` appends, then flushes if `items.len() >= max_items` or `flush_interval` has elapsed since the last flush.
-- `flush_batch(client, &mut batch)` publishes unconditionally (a no-op when empty).
-- `read_batch::<T>(&message) -> Result<Vec<T>>` decodes a received batch on the subscriber side.
+- `Batch::new(topic, route, max_items, flush_interval) -> Batch<T>`
+- `batch.push(&client, item)` appends, then flushes if `items.len() >= max_items` or `flush_interval` has elapsed since the last flush.
+- `batch.flush(&client)` publishes unconditionally (a no-op when empty).
+- `message.read_batch::<T>() -> Result<Vec<T>>` decodes a received batch on the subscriber side.
 
-The interval check happens on push, so a batch with no traffic holds its items until the next push or a manual flush. Callers with a periodic loop (the `Lifecycle` `update` hook is the natural place) call `flush_batch` once per tick to bound worst-case latency.
+The interval check happens on push, so a batch with no traffic holds its items until the next push or a manual flush. Callers with a periodic loop (the `Lifecycle` `update` hook is the natural place) call `batch.flush(&client)` once per tick to bound worst-case latency.
 
 A useful property of the elapsed-time trigger: the first item pushed after an idle period flushes immediately, because the interval has already elapsed. Bursts therefore start with low latency and then coalesce.
 
 ## 3. Wire format
 
-A flush serializes `Vec<T>` with postcard and publishes it via `publish_bytes`, so subscribers receive a binary `Message` (its payload comes through `bytes()`, and `text()` is `None`). `read_batch` is the inverse. The 64 MiB frame cap bounds the worst-case batch; a batch that would exceed it fails to serialize and is kept (see below) rather than sent.
+A flush serializes `Vec<T>` with postcard and publishes it via `publish_bytes`, so subscribers receive a binary `Message` (its payload comes through `bytes()`, and `text()` is `None`). `read_batch` is the inverse. The single-value counterpart to this collection path is `client.publish_postcard(topic, &value, route)` with `message.read::<T>()`, the same postcard encoding for one value instead of a `Vec`. The 64 MiB frame cap bounds the worst-case batch; a batch that would exceed it fails to serialize and is kept (see below) rather than sent.
 
 ## 4. Failure semantics
 
-`flush_batch` only clears `items` after the publish succeeds. If the connection is down, the error propagates, the items stay in the batch, and the next push or flush retries, so a reconnect does not silently drop a batch. The trade-off is that items accumulate while disconnected; callers that prefer dropping stale state over replaying it can `items.clear()` themselves, since the field is public.
+`flush` only clears `items` after the publish succeeds. If the connection is down, the error propagates, the items stay in the batch, and the next push or flush retries, so a reconnect does not silently drop a batch. The trade-off is that items accumulate while disconnected; callers that prefer dropping stale state over replaying it can `items.clear()` themselves, since the field is public.
 
 ## 5. Coalescing
 

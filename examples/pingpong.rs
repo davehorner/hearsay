@@ -1,14 +1,13 @@
 use hearsay::{
-    Client, ClientSettings, Interrupt, Lifecycle, LifecycleSettings, Message, Route,
-    broker_is_running, connect, create_client,
+    Broker, Client, ClientSettings, Interrupt, Lifecycle, LifecycleSettings, Message, Route,
     enum2contract::{self, EnumContract},
-    next_message, publish, run_lifecycle, start_broker, subscribe,
+    run_lifecycle,
 };
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 #[cfg(feature = "spawn")]
-use hearsay::{App, AppStatus, app_status, drain_output, spawn_app};
+use hearsay::{App, AppStatus};
 
 const BROKER_ADDRESS: &str = "127.0.0.1:9612";
 
@@ -55,7 +54,7 @@ struct Responder;
 impl Lifecycle for Responder {
     async fn initialize(&mut self, client: &Client) {
         let topic = PingPongContract::command_topic(PingPongContract::BROADCAST);
-        let _ = subscribe(client, &[&topic]).await;
+        let _ = client.subscribe(&[&topic]).await;
     }
 
     async fn receive_message(&mut self, message: &Message, client: &Client) -> Option<Interrupt> {
@@ -70,7 +69,9 @@ impl Lifecycle for Responder {
                     let (event_topic, mut event_payload) =
                         PingPongContract::event(PingPongContract::BROADCAST);
                     event_payload.event = PingPongEvent::Pong { value: 42 };
-                    let _ = publish(client, &event_topic, &event_payload, Route::Global).await;
+                    let _ = client
+                        .publish(&event_topic, &event_payload, Route::Global)
+                        .await;
                 }
             }
             _ => {}
@@ -94,34 +95,30 @@ async fn main() -> hearsay::Result<()> {
 
 #[cfg(feature = "spawn")]
 async fn run_host() -> hearsay::Result<()> {
-    let broker = start_broker(BROKER_ADDRESS).await?;
+    let broker = Broker::start(BROKER_ADDRESS).await?;
     let executable = std::env::current_exe()?.display().to_string();
-    spawn_app(
-        &broker,
-        App {
+    broker
+        .spawn_app(App {
             name: "responder".to_string(),
             path: executable.clone(),
             args: "responder".to_string(),
             ..Default::default()
-        },
-    )
-    .await?;
-    spawn_app(
-        &broker,
-        App {
+        })
+        .await?;
+    broker
+        .spawn_app(App {
             name: "requester".to_string(),
             path: executable,
             args: "requester".to_string(),
             ..Default::default()
-        },
-    )
-    .await?;
+        })
+        .await?;
 
     loop {
-        for line in drain_output(&broker).await {
+        for line in broker.drain_output().await {
             println!("[host] {}: {}", line.app_name, line.line);
         }
-        if app_status(&broker, "requester").await == AppStatus::ExitedSuccessfully {
+        if broker.app_status("requester").await == AppStatus::ExitedSuccessfully {
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -137,31 +134,31 @@ fn responder_settings() -> LifecycleSettings {
 }
 
 async fn run_broker() -> hearsay::Result<()> {
-    let broker = start_broker(BROKER_ADDRESS).await?;
+    let broker = Broker::start(BROKER_ADDRESS).await?;
     println!("[broker] listening on {BROKER_ADDRESS}");
-    while broker_is_running(&broker) {
+    while broker.is_running() {
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
     Ok(())
 }
 
 async fn run_requester() -> hearsay::Result<()> {
-    let requester = create_client("requester", ClientSettings::default());
-    connect(&requester, BROKER_ADDRESS).await?;
-    subscribe(
-        &requester,
-        &[&PingPongContract::event_topic(PingPongContract::BROADCAST)],
-    )
-    .await?;
+    let requester = Client::new("requester", ClientSettings::default());
+    requester.connect(BROKER_ADDRESS).await?;
+    requester
+        .subscribe(&[&PingPongContract::event_topic(PingPongContract::BROADCAST)])
+        .await?;
 
     loop {
         let (command_topic, mut command_payload) =
             PingPongContract::command(PingPongContract::BROADCAST);
         command_payload.command = PingPongCommand::Ping;
-        publish(&requester, &command_topic, &command_payload, Route::Global).await?;
+        requester
+            .publish(&command_topic, &command_payload, Route::Global)
+            .await?;
 
         let received =
-            tokio::time::timeout(Duration::from_millis(100), next_message(&requester)).await;
+            tokio::time::timeout(Duration::from_millis(100), requester.next_message()).await;
         let Ok(Some(message)) = received else {
             continue;
         };
@@ -179,7 +176,7 @@ async fn run_requester() -> hearsay::Result<()> {
 }
 
 async fn run_all_in_one() -> hearsay::Result<()> {
-    let _broker = start_broker(BROKER_ADDRESS).await?;
+    let _broker = Broker::start(BROKER_ADDRESS).await?;
     tokio::spawn(run_lifecycle(Responder, responder_settings()));
     run_requester().await
 }

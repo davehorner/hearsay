@@ -111,9 +111,9 @@ async fn broker_runtime_loop(
     event_sender: UnboundedSender<RuntimeEvent>,
 ) {
     let (broker, address) = match role {
-        WindowRole::Primary => match hearsay::start_broker(BROKER_ADDRESS).await {
+        WindowRole::Primary => match hearsay::Broker::start(BROKER_ADDRESS).await {
             Ok(broker) => {
-                let _ = hearsay::start_websocket_listener(&broker, WEBSOCKET_ADDRESS).await;
+                let _ = broker.start_websocket_listener(WEBSOCKET_ADDRESS).await;
                 (Some(broker), BROKER_ADDRESS.to_string())
             }
             Err(error) => {
@@ -126,14 +126,14 @@ async fn broker_runtime_loop(
         WindowRole::Child { broker_address } => (None, broker_address),
     };
 
-    let mut client = hearsay::create_client("window", hearsay::ClientSettings::default());
-    if let Err(error) = hearsay::connect(&mut client, &address).await {
+    let mut client = hearsay::Client::new("window", hearsay::ClientSettings::default());
+    if let Err(error) = client.connect(&address).await {
         let _ = event_sender.send(RuntimeEvent::Failed {
             reason: error.to_string(),
         });
         return;
     }
-    let client_id = hearsay::client_id(&client).to_string();
+    let client_id = client.id().to_string();
     let _ = event_sender.send(RuntimeEvent::Connected {
         client_id,
         address: address.clone(),
@@ -150,7 +150,7 @@ async fn broker_runtime_loop(
                     }
                     None => break,
                 },
-                inbound = hearsay::next_message(&mut client) => match inbound {
+                inbound = client.next_message() => match inbound {
                     Some(message) => {
                         let _ = event_sender.send(RuntimeEvent::Inbound {
                             topic: message.topic().to_string(),
@@ -173,9 +173,9 @@ async fn broker_runtime_loop(
                     None => break,
                 },
                 _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
-                    if hearsay::is_connected(&client).await {
+                    if client.is_connected().await {
                         connected = true;
-                        let client_id = hearsay::client_id(&client).to_string();
+                        let client_id = client.id().to_string();
                         let _ = event_sender.send(RuntimeEvent::Connected {
                             client_id,
                             address: address.clone(),
@@ -195,18 +195,18 @@ async fn execute_runtime_command(
 ) {
     match command {
         RuntimeCommand::Publish { topic, message } => {
-            let _ = hearsay::publish_json(client, &topic, &message, hearsay::Route::Global).await;
+            let _ = client.publish_json(&topic, &message, hearsay::Route::Global).await;
         }
         RuntimeCommand::PublishBytes { topic, bytes } => {
-            let _ = hearsay::publish_bytes(client, &topic, &bytes, hearsay::Route::Global).await;
+            let _ = client.publish_bytes(&topic, &bytes, hearsay::Route::Global).await;
         }
         RuntimeCommand::Subscribe { topics } => {
             let topic_references: Vec<&str> = topics.iter().map(String::as_str).collect();
-            let _ = hearsay::subscribe(client, &topic_references).await;
+            let _ = client.subscribe(&topic_references).await;
         }
         RuntimeCommand::Unsubscribe { topics } => {
             let topic_references: Vec<&str> = topics.iter().map(String::as_str).collect();
-            let _ = hearsay::unsubscribe(client, &topic_references).await;
+            let _ = client.unsubscribe(&topic_references).await;
         }
         RuntimeCommand::SpawnWindow => {
             let Some(broker) = broker else {
@@ -216,16 +216,14 @@ async fn execute_runtime_command(
                 return;
             };
             *window_counter += 1;
-            let _ = hearsay::spawn_app(
-                broker,
-                hearsay::App {
+            let _ = broker
+                .spawn_app(hearsay::App {
                     name: format!("window-{window_counter}"),
                     path: executable.display().to_string(),
                     restart_policy: hearsay::RestartPolicy::Never,
                     ..Default::default()
-                },
-            )
-            .await;
+                })
+                .await;
         }
     }
 }

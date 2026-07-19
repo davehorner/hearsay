@@ -1,8 +1,5 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-use hearsay::{
-    Broker, Client, ClientSettings, Route, connect, create_client, next_message, publish,
-    start_broker, subscribe,
-};
+use hearsay::{Broker, Client, ClientSettings, Route};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio::runtime::Runtime;
@@ -21,12 +18,12 @@ fn bench_settings() -> ClientSettings {
 }
 
 async fn connected_pair(broker_address: &str, topic: &str) -> (Broker, Client, Client) {
-    let broker = start_broker(broker_address).await.unwrap();
-    let publisher = create_client("bench_publisher", bench_settings());
-    connect(&publisher, broker_address).await.unwrap();
-    let subscriber = create_client("bench_subscriber", bench_settings());
-    connect(&subscriber, broker_address).await.unwrap();
-    subscribe(&subscriber, &[topic]).await.unwrap();
+    let broker = Broker::start(broker_address).await.unwrap();
+    let publisher = Client::new("bench_publisher", bench_settings());
+    publisher.connect(broker_address).await.unwrap();
+    let subscriber = Client::new("bench_subscriber", bench_settings());
+    subscriber.connect(broker_address).await.unwrap();
+    subscriber.subscribe(&[topic]).await.unwrap();
     tokio::time::sleep(Duration::from_millis(250)).await;
     (broker, publisher, subscriber)
 }
@@ -44,10 +41,11 @@ fn round_trip(criterion: &mut Criterion) {
 
     criterion.bench_function("round_trip", |bencher| {
         bencher.to_async(&runtime).iter(|| async {
-            publish(&publisher, topic, &payload, Route::Global)
+            publisher
+                .publish(topic, &payload, Route::Global)
                 .await
                 .unwrap();
-            next_message(&*subscriber.lock().await).await.unwrap()
+            subscriber.lock().await.next_message().await.unwrap()
         });
     });
 }
@@ -56,9 +54,9 @@ fn publish_only(criterion: &mut Criterion) {
     let runtime = Runtime::new().unwrap();
     let broker_address = "127.0.0.1:9951";
     let (_broker, publisher) = runtime.block_on(async {
-        let broker = start_broker(broker_address).await.unwrap();
-        let publisher = create_client("bench_publisher", bench_settings());
-        connect(&publisher, broker_address).await.unwrap();
+        let broker = Broker::start(broker_address).await.unwrap();
+        let publisher = Client::new("bench_publisher", bench_settings());
+        publisher.connect(broker_address).await.unwrap();
         (broker, publisher)
     });
     let payload = BenchPayload {
@@ -68,7 +66,8 @@ fn publish_only(criterion: &mut Criterion) {
 
     criterion.bench_function("publish_only", |bencher| {
         bencher.to_async(&runtime).iter(|| async {
-            publish(&publisher, "bench/publish-only", &payload, Route::Global)
+            publisher
+                .publish("bench/publish-only", &payload, Route::Global)
                 .await
                 .unwrap()
         });

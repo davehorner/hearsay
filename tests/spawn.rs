@@ -1,14 +1,11 @@
 #![cfg(feature = "spawn")]
 
-use hearsay::{
-    App, AppStatus, Broker, RestartPolicy, app_status, drain_output, spawn_app, start_broker,
-    stop_app,
-};
+use hearsay::{App, AppStatus, Broker, RestartPolicy};
 use std::time::Duration;
 
 async fn wait_for_exit(broker: &Broker, name: &str) -> AppStatus {
     loop {
-        let status = app_status(broker, name).await;
+        let status = broker.app_status(name).await;
         if !matches!(status, AppStatus::Running) {
             return status;
         }
@@ -18,24 +15,22 @@ async fn wait_for_exit(broker: &Broker, name: &str) -> AppStatus {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn spawned_app_reports_output_and_exit() -> hearsay::Result<()> {
-    let broker = start_broker("127.0.0.1:9941").await?;
-    spawn_app(
-        &broker,
-        App {
+    let broker = Broker::start("127.0.0.1:9941").await?;
+    broker
+        .spawn_app(App {
             name: "version".to_string(),
             path: "rustc".to_string(),
             args: "--version".to_string(),
             ..Default::default()
-        },
-    )
-    .await?;
+        })
+        .await?;
 
     let status =
         tokio::time::timeout(Duration::from_secs(30), wait_for_exit(&broker, "version")).await?;
     assert_eq!(status, AppStatus::ExitedSuccessfully);
 
     tokio::time::sleep(Duration::from_millis(250)).await;
-    let lines = drain_output(&broker).await;
+    let lines = broker.drain_output().await;
     assert!(lines.iter().any(|line| line.line.contains("rustc")));
     Ok(())
 }
@@ -43,7 +38,7 @@ async fn spawned_app_reports_output_and_exit() -> hearsay::Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn spawned_app_receives_broker_address() -> hearsay::Result<()> {
     let broker_address = "127.0.0.1:9942";
-    let broker = start_broker(broker_address).await?;
+    let broker = Broker::start(broker_address).await?;
 
     #[cfg(target_os = "windows")]
     let app = App {
@@ -58,7 +53,7 @@ async fn spawned_app_receives_broker_address() -> hearsay::Result<()> {
         path: "env".to_string(),
         ..Default::default()
     };
-    spawn_app(&broker, app).await?;
+    broker.spawn_app(app).await?;
 
     let status = tokio::time::timeout(
         Duration::from_secs(30),
@@ -68,7 +63,7 @@ async fn spawned_app_receives_broker_address() -> hearsay::Result<()> {
     assert_eq!(status, AppStatus::ExitedSuccessfully);
 
     tokio::time::sleep(Duration::from_millis(250)).await;
-    let lines = drain_output(&broker).await;
+    let lines = broker.drain_output().await;
     let expected = format!("HEARSAY_BROKER={broker_address}");
     assert!(lines.iter().any(|line| line.line.contains(&expected)));
     Ok(())
@@ -76,21 +71,19 @@ async fn spawned_app_receives_broker_address() -> hearsay::Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn always_restart_policy_relaunches_exited_apps() -> hearsay::Result<()> {
-    let broker = start_broker("127.0.0.1:9943").await?;
-    spawn_app(
-        &broker,
-        App {
+    let broker = Broker::start("127.0.0.1:9943").await?;
+    broker
+        .spawn_app(App {
             name: "repeater".to_string(),
             path: "rustc".to_string(),
             args: "--version".to_string(),
             restart_policy: RestartPolicy::Always,
             ..Default::default()
-        },
-    )
-    .await?;
+        })
+        .await?;
 
     tokio::time::sleep(Duration::from_secs(3)).await;
-    let lines = drain_output(&broker).await;
+    let lines = broker.drain_output().await;
     let launches = lines
         .iter()
         .filter(|line| line.line.contains("rustc"))
@@ -104,7 +97,7 @@ async fn always_restart_policy_relaunches_exited_apps() -> hearsay::Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn stopped_apps_stay_stopped() -> hearsay::Result<()> {
-    let broker = start_broker("127.0.0.1:9944").await?;
+    let broker = Broker::start("127.0.0.1:9944").await?;
 
     #[cfg(target_os = "windows")]
     let app = App {
@@ -120,22 +113,13 @@ async fn stopped_apps_stay_stopped() -> hearsay::Result<()> {
         args: "60".to_string(),
         ..Default::default()
     };
-    spawn_app(&broker, app).await?;
+    broker.spawn_app(app).await?;
 
-    assert_eq!(
-        app_status(&broker, "long_running").await,
-        AppStatus::Running
-    );
-    stop_app(&broker, "long_running").await?;
-    assert_eq!(
-        app_status(&broker, "long_running").await,
-        AppStatus::Stopped
-    );
+    assert_eq!(broker.app_status("long_running").await, AppStatus::Running);
+    broker.stop_app("long_running").await?;
+    assert_eq!(broker.app_status("long_running").await, AppStatus::Stopped);
 
     tokio::time::sleep(Duration::from_secs(1)).await;
-    assert_eq!(
-        app_status(&broker, "long_running").await,
-        AppStatus::Stopped
-    );
+    assert_eq!(broker.app_status("long_running").await, AppStatus::Stopped);
     Ok(())
 }

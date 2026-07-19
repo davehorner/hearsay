@@ -1,10 +1,6 @@
 #![cfg(feature = "udp")]
 
-use hearsay::{
-    ClientSettings, Delivery, Route, connect, create_client, create_udp_client, next_message,
-    next_udp_message, publish, start_broker, start_udp_listener, subscribe, udp_publish,
-    udp_subscribe,
-};
+use hearsay::{Broker, Client, ClientSettings, Delivery, Route, UdpClient};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -32,30 +28,33 @@ fn test_settings() -> ClientSettings {
 async fn udp_client_and_tcp_peer_interoperate() -> hearsay::Result<()> {
     let broker_address = "127.0.0.1:9963";
     let udp_address = "127.0.0.1:9964";
-    let broker = start_broker(broker_address).await?;
-    start_udp_listener(&broker, udp_address).await?;
+    let broker = Broker::start(broker_address).await?;
+    broker.start_udp_listener(udp_address).await?;
 
-    let tcp_client = create_client("tcp_peer", test_settings());
-    connect(&tcp_client, broker_address).await?;
-    subscribe(&tcp_client, &["from/udp"]).await?;
+    let tcp_client = Client::new("tcp_peer", test_settings());
+    tcp_client.connect(broker_address).await?;
+    tcp_client.subscribe(&["from/udp"]).await?;
 
-    let udp = create_udp_client("udp_peer", udp_address).await?;
-    udp_subscribe(&udp, &["from/tcp"]).await?;
+    let udp = UdpClient::connect("udp_peer", udp_address).await?;
+    udp.subscribe(&["from/tcp"]).await?;
     tokio::time::sleep(Duration::from_millis(400)).await;
 
     let payload = sample();
-    udp_publish(&udp, "from/udp", &payload, Delivery::ReliableOrdered).await?;
+    udp.publish("from/udp", &payload, Delivery::ReliableOrdered)
+        .await?;
 
-    let message = tokio::time::timeout(Duration::from_secs(5), next_message(&tcp_client))
+    let message = tokio::time::timeout(Duration::from_secs(5), tcp_client.next_message())
         .await?
         .expect("tcp peer should receive the udp publish");
     assert_eq!(message.topic(), "from/udp");
     let received: TestPayload = serde_json::from_str(message.text().unwrap())?;
     assert_eq!(received, payload);
 
-    publish(&tcp_client, "from/tcp", &payload, Route::Global).await?;
+    tcp_client
+        .publish("from/tcp", &payload, Route::Global)
+        .await?;
 
-    let message = tokio::time::timeout(Duration::from_secs(5), next_udp_message(&udp))
+    let message = tokio::time::timeout(Duration::from_secs(5), udp.next_message())
         .await?
         .expect("udp peer should receive the tcp publish");
     assert_eq!(message.topic(), "from/tcp");
@@ -68,25 +67,27 @@ async fn udp_client_and_tcp_peer_interoperate() -> hearsay::Result<()> {
 async fn reliable_and_unreliable_publishes_both_deliver() -> hearsay::Result<()> {
     let broker_address = "127.0.0.1:9965";
     let udp_address = "127.0.0.1:9966";
-    let broker = start_broker(broker_address).await?;
-    start_udp_listener(&broker, udp_address).await?;
+    let broker = Broker::start(broker_address).await?;
+    broker.start_udp_listener(udp_address).await?;
 
-    let tcp_client = create_client("tcp_peer", test_settings());
-    connect(&tcp_client, broker_address).await?;
-    subscribe(&tcp_client, &["updates", "events"]).await?;
+    let tcp_client = Client::new("tcp_peer", test_settings());
+    tcp_client.connect(broker_address).await?;
+    tcp_client.subscribe(&["updates", "events"]).await?;
 
-    let udp = create_udp_client("udp_peer", udp_address).await?;
+    let udp = UdpClient::connect("udp_peer", udp_address).await?;
     tokio::time::sleep(Duration::from_millis(400)).await;
 
-    udp_publish(&udp, "updates", &sample(), Delivery::Unreliable).await?;
-    udp_publish(&udp, "events", &sample(), Delivery::ReliableOrdered).await?;
+    udp.publish("updates", &sample(), Delivery::Unreliable)
+        .await?;
+    udp.publish("events", &sample(), Delivery::ReliableOrdered)
+        .await?;
 
     let mut seen_updates = false;
     let mut seen_events = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while (!seen_updates || !seen_events) && tokio::time::Instant::now() < deadline {
         let Ok(Some(message)) =
-            tokio::time::timeout(Duration::from_secs(2), next_message(&tcp_client)).await
+            tokio::time::timeout(Duration::from_secs(2), tcp_client.next_message()).await
         else {
             break;
         };
@@ -105,24 +106,26 @@ async fn reliable_and_unreliable_publishes_both_deliver() -> hearsay::Result<()>
 async fn multiple_udp_clients_each_receive() -> hearsay::Result<()> {
     let broker_address = "127.0.0.1:9967";
     let udp_address = "127.0.0.1:9968";
-    let broker = start_broker(broker_address).await?;
-    start_udp_listener(&broker, udp_address).await?;
+    let broker = Broker::start(broker_address).await?;
+    broker.start_udp_listener(udp_address).await?;
 
-    let publisher = create_client("publisher", test_settings());
-    connect(&publisher, broker_address).await?;
+    let publisher = Client::new("publisher", test_settings());
+    publisher.connect(broker_address).await?;
 
-    let first = create_udp_client("first", udp_address).await?;
-    let second = create_udp_client("second", udp_address).await?;
-    udp_subscribe(&first, &["shared"]).await?;
-    udp_subscribe(&second, &["shared"]).await?;
+    let first = UdpClient::connect("first", udp_address).await?;
+    let second = UdpClient::connect("second", udp_address).await?;
+    first.subscribe(&["shared"]).await?;
+    second.subscribe(&["shared"]).await?;
     tokio::time::sleep(Duration::from_millis(400)).await;
 
-    publish(&publisher, "shared", &sample(), Route::Global).await?;
+    publisher
+        .publish("shared", &sample(), Route::Global)
+        .await?;
 
-    let first_message = tokio::time::timeout(Duration::from_secs(5), next_udp_message(&first))
+    let first_message = tokio::time::timeout(Duration::from_secs(5), first.next_message())
         .await?
         .expect("first udp client should receive");
-    let second_message = tokio::time::timeout(Duration::from_secs(5), next_udp_message(&second))
+    let second_message = tokio::time::timeout(Duration::from_secs(5), second.next_message())
         .await?
         .expect("second udp client should receive");
     assert_eq!(first_message.topic(), "shared");
@@ -134,22 +137,22 @@ async fn multiple_udp_clients_each_receive() -> hearsay::Result<()> {
 async fn a_large_reliable_message_fragments_and_reassembles_over_udp() -> hearsay::Result<()> {
     let broker_address = "127.0.0.1:9969";
     let udp_address = "127.0.0.1:9970";
-    let broker = start_broker(broker_address).await?;
-    start_udp_listener(&broker, udp_address).await?;
+    let broker = Broker::start(broker_address).await?;
+    broker.start_udp_listener(udp_address).await?;
 
-    let subscriber = create_client("subscriber", test_settings());
-    connect(&subscriber, broker_address).await?;
-    subscribe(&subscriber, &["big"]).await?;
+    let subscriber = Client::new("subscriber", test_settings());
+    subscriber.connect(broker_address).await?;
+    subscriber.subscribe(&["big"]).await?;
 
-    let udp = create_udp_client("udp_peer", udp_address).await?;
+    let udp = UdpClient::connect("udp_peer", udp_address).await?;
     tokio::time::sleep(Duration::from_millis(400)).await;
 
     // A payload many fragments long: the client fragments it on the reliable
     // channel and the broker's endpoint reassembles it before delivery.
     let big: Vec<u32> = (0..4000).collect();
-    udp_publish(&udp, "big", &big, Delivery::ReliableOrdered).await?;
+    udp.publish("big", &big, Delivery::ReliableOrdered).await?;
 
-    let message = tokio::time::timeout(Duration::from_secs(5), next_message(&subscriber))
+    let message = tokio::time::timeout(Duration::from_secs(5), subscriber.next_message())
         .await?
         .expect("large reliable message should reassemble");
     assert_eq!(message.topic(), "big");

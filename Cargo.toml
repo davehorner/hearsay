@@ -57,6 +57,7 @@ futures-util = { version = "0.3", default-features = false, features = [
     "sink",
     "std",
 ] }
+proptest = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tokio-tungstenite = "0.26"
 

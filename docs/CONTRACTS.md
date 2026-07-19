@@ -37,7 +37,7 @@ Subscribers receive [`Message`], which is a view over the received `Deliver` fra
 
 `Route` (`Global`, `Local`) is a client-side concept; only the local-only flag derived from it crosses the wire. See [CLIENT.md](CLIENT.md) section 3.
 
-Clients that implement the protocol directly (WebSocket and WASM peers) build frames with the public helpers instead of hand-assembling bytes: `encode_hello`, `encode_subscribe`, `encode_unsubscribe`, `encode_publish_text`, `encode_publish_binary`, and `decode_message`. These helpers, `Message`, and `read_batch` compile on `wasm32`, so a browser crate depends on hearsay itself for the wire format instead of mirroring it.
+Clients that implement the protocol directly (WebSocket and WASM peers) build frames with the public helpers instead of hand-assembling bytes: `encode_hello`, `encode_subscribe`, `encode_unsubscribe`, `encode_publish_text`, `encode_publish_binary`, and `decode_message`. These helpers and `Message` (with its `read_batch` and `read` decoders) compile on `wasm32`, so a browser crate depends on hearsay itself for the wire format instead of mirroring it.
 
 ## 3. The contract pattern
 
@@ -80,7 +80,7 @@ Publish with the generated constructors:
 ```rust
 let (topic, mut payload) = PingPongContract::command("broadcast");
 payload.command = PingPongCommand::Ping;
-hearsay::publish(&client, &topic, &payload, hearsay::Route::Global).await?;
+client.publish(&topic, &payload, hearsay::Route::Global).await?;
 ```
 
 Receive by matching the topic and deserializing the payload struct:

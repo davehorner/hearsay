@@ -91,88 +91,105 @@ pub(crate) fn create_spawner(broker_address: &str) -> Spawner {
     Spawner { state }
 }
 
-pub async fn spawn_app(broker: &Broker, app: App) -> Result<()> {
-    let mut state = broker.spawner.state.lock().await;
-    if let Some(managed) = state.apps.get_mut(&app.name)
-        && matches!(poll_status(managed), AppStatus::Running)
-    {
-        return Err(Error::AppAlreadyRunning(app.name.clone()));
+impl Broker {
+    /// Spawns `app` as a supervised child process. The child receives the
+    /// broker's address in the [`BROKER_ADDRESS_VARIABLE`] environment
+    /// variable, is restarted according to its [`App::restart_policy`], and is
+    /// killed when the broker is dropped. Returns
+    /// [`crate::Error::AppAlreadyRunning`] if an app of the same name is already
+    /// running.
+    pub async fn spawn_app(&self, app: App) -> Result<()> {
+        let mut state = self.spawner.state.lock().await;
+        if let Some(managed) = state.apps.get_mut(&app.name)
+            && matches!(poll_status(managed), AppStatus::Running)
+        {
+            return Err(Error::AppAlreadyRunning(app.name.clone()));
+        }
+        let child = launch(&app, &state.broker_address, &state.output_sender)?;
+        state.apps.insert(
+            app.name.clone(),
+            ManagedApp {
+                descriptor: app,
+                child: Some(child),
+                last_status: AppStatus::Running,
+            },
+        );
+        Ok(())
     }
-    let child = launch(&app, &state.broker_address, &state.output_sender)?;
-    state.apps.insert(
-        app.name.clone(),
-        ManagedApp {
-            descriptor: app,
-            child: Some(child),
-            last_status: AppStatus::Running,
-        },
-    );
-    Ok(())
-}
 
-pub async fn stop_app(broker: &Broker, name: &str) -> Result<()> {
-    let mut state = broker.spawner.state.lock().await;
-    let Some(managed) = state.apps.get_mut(name) else {
-        return Err(Error::AppNotFound(name.to_string()));
-    };
-    if let Some(child) = managed.child.as_mut() {
-        let _ = child.kill().await;
+    /// Stops the supervised app named `name`, killing its process without
+    /// restarting it. Returns [`crate::Error::AppNotFound`] if no such app is
+    /// managed.
+    pub async fn stop_app(&self, name: &str) -> Result<()> {
+        let mut state = self.spawner.state.lock().await;
+        let Some(managed) = state.apps.get_mut(name) else {
+            return Err(Error::AppNotFound(name.to_string()));
+        };
+        if let Some(child) = managed.child.as_mut() {
+            let _ = child.kill().await;
+        }
+        managed.child = None;
+        managed.last_status = AppStatus::Stopped;
+        Ok(())
     }
-    managed.child = None;
-    managed.last_status = AppStatus::Stopped;
-    Ok(())
-}
 
-pub async fn restart_app(broker: &Broker, name: &str) -> Result<()> {
-    let mut state = broker.spawner.state.lock().await;
-    let Some(managed) = state.apps.get_mut(name) else {
-        return Err(Error::AppNotFound(name.to_string()));
-    };
-    if let Some(child) = managed.child.as_mut() {
-        let _ = child.kill().await;
+    /// Restarts the supervised app named `name`, killing the current process (if
+    /// any) and launching a fresh one. Returns [`crate::Error::AppNotFound`] if
+    /// no such app is managed.
+    pub async fn restart_app(&self, name: &str) -> Result<()> {
+        let mut state = self.spawner.state.lock().await;
+        let Some(managed) = state.apps.get_mut(name) else {
+            return Err(Error::AppNotFound(name.to_string()));
+        };
+        if let Some(child) = managed.child.as_mut() {
+            let _ = child.kill().await;
+        }
+        managed.child = None;
+        let descriptor = managed.descriptor.clone();
+        let broker_address = state.broker_address.clone();
+        let output_sender = state.output_sender.clone();
+        let child = launch(&descriptor, &broker_address, &output_sender)?;
+        if let Some(managed) = state.apps.get_mut(name) {
+            managed.child = Some(child);
+            managed.last_status = AppStatus::Running;
+        }
+        Ok(())
     }
-    managed.child = None;
-    let descriptor = managed.descriptor.clone();
-    let broker_address = state.broker_address.clone();
-    let output_sender = state.output_sender.clone();
-    let child = launch(&descriptor, &broker_address, &output_sender)?;
-    if let Some(managed) = state.apps.get_mut(name) {
-        managed.child = Some(child);
-        managed.last_status = AppStatus::Running;
-    }
-    Ok(())
-}
 
-pub async fn app_status(broker: &Broker, name: &str) -> AppStatus {
-    let mut state = broker.spawner.state.lock().await;
-    match state.apps.get_mut(name) {
-        Some(managed) => poll_status(managed),
-        None => AppStatus::NotFound,
+    /// The current [`AppStatus`] of the supervised app named `name`, or
+    /// [`AppStatus::NotFound`] if it is not managed.
+    pub async fn app_status(&self, name: &str) -> AppStatus {
+        let mut state = self.spawner.state.lock().await;
+        match state.apps.get_mut(name) {
+            Some(managed) => poll_status(managed),
+            None => AppStatus::NotFound,
+        }
     }
-}
 
-pub async fn app_statuses(broker: &Broker) -> Vec<(String, AppStatus)> {
-    let mut state = broker.spawner.state.lock().await;
-    let mut statuses: Vec<(String, AppStatus)> = state
-        .apps
-        .iter_mut()
-        .map(|(name, managed)| (name.clone(), poll_status(managed)))
-        .collect();
-    statuses.sort_by(|left, right| left.0.cmp(&right.0));
-    statuses
-}
-
-/// Drains buffered stdout/stderr lines from supervised apps. Output is held in
-/// a bounded buffer and is best-effort: if this is not called often enough,
-/// further lines are dropped once the buffer fills, so it is not a complete
-/// log. Call it on a regular interval to avoid loss.
-pub async fn drain_output(broker: &Broker) -> Vec<OutputLine> {
-    let mut state = broker.spawner.state.lock().await;
-    let mut lines = Vec::new();
-    while let Ok(line) = state.output_receiver.try_recv() {
-        lines.push(line);
+    /// The current status of every supervised app, sorted by name.
+    pub async fn app_statuses(&self) -> Vec<(String, AppStatus)> {
+        let mut state = self.spawner.state.lock().await;
+        let mut statuses: Vec<(String, AppStatus)> = state
+            .apps
+            .iter_mut()
+            .map(|(name, managed)| (name.clone(), poll_status(managed)))
+            .collect();
+        statuses.sort_by(|left, right| left.0.cmp(&right.0));
+        statuses
     }
-    lines
+
+    /// Drains buffered stdout/stderr lines from supervised apps. Output is held
+    /// in a bounded buffer and is best-effort: if this is not called often
+    /// enough, further lines are dropped once the buffer fills, so it is not a
+    /// complete log. Call it on a regular interval to avoid loss.
+    pub async fn drain_output(&self) -> Vec<OutputLine> {
+        let mut state = self.spawner.state.lock().await;
+        let mut lines = Vec::new();
+        while let Ok(line) = state.output_receiver.try_recv() {
+            lines.push(line);
+        }
+        lines
+    }
 }
 
 fn launch(app: &App, broker_address: &str, output_sender: &Sender<OutputLine>) -> Result<Child> {

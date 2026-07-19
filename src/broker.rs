@@ -2,7 +2,6 @@ use crate::{
     BrokerContract, Result,
     arena::{Arena, PeerId},
     bridge::{Bridge, BridgeCommand, BridgeRegistry, connect_bridge, spawn_bridge},
-    open_bridge_acked,
     wire::{
         DELIVER_PAYLOAD_OFFSET, FLAG_BINARY, FLAG_LOCAL_ONLY, Frame, FrameReader, FrameView,
         MAX_WRITE_BATCH, encode_deliver_header, encode_deliver_text, encode_forward_header,
@@ -30,11 +29,63 @@ const REORDER_WINDOW: u64 = 1024;
 const REORDER_WORDS: usize = (REORDER_WINDOW / 64) as usize;
 const MAX_TRACKED_ORIGINS: usize = 1024;
 
+/// A running message broker: the hub that peers connect to and exchange
+/// messages through.
+///
+/// Start one with [`Broker::start`]. The broker owns background tasks that
+/// accept connections and route messages; it runs for as long as the value is
+/// held, and [`Broker::stop`] (or dropping it) shuts everything down. With the
+/// optional transports enabled, [`Broker::start_websocket_listener`] and
+/// [`Broker::start_udp_listener`] add peers on other transports that share the
+/// same subscription table, and with the `spawn` feature the broker can own and
+/// supervise client processes.
 pub struct Broker {
     pub(crate) sender: Sender<BrokerEvent>,
     pub(crate) shutdown_sender: watch::Sender<bool>,
     #[cfg(feature = "spawn")]
     pub(crate) spawner: crate::spawn::Spawner,
+}
+
+impl Broker {
+    /// Starts a broker listening for TCP peers on `address`.
+    ///
+    /// `address` is a host:port pair; use `127.0.0.1:0` to bind an
+    /// operating-system-assigned port. The returned [`Broker`] holds the bus
+    /// open, so keep it alive for as long as peers should be able to connect.
+    pub async fn start(address: &str) -> Result<Broker> {
+        let listener = create_listener(resolve_address(address).await?)?;
+        let (event_sender, event_receiver) = mpsc::channel(BROKER_EVENT_CAPACITY);
+        let (shutdown_sender, shutdown_receiver) = watch::channel(false);
+        let instance_id = uuid::Uuid::new_v4().as_u128();
+        tokio::spawn(broker_loop(
+            event_receiver,
+            shutdown_receiver.clone(),
+            instance_id,
+        ));
+        tokio::spawn(accept_loop(
+            listener,
+            event_sender.clone(),
+            shutdown_receiver,
+        ));
+        Ok(Broker {
+            sender: event_sender,
+            shutdown_sender,
+            #[cfg(feature = "spawn")]
+            spawner: crate::spawn::create_spawner(address),
+        })
+    }
+
+    /// Whether the broker's routing loop is still running. Returns `false` once
+    /// the broker has been stopped or dropped.
+    pub fn is_running(&self) -> bool {
+        !self.sender.is_closed()
+    }
+
+    /// Shuts the broker down, closing its listeners and disconnecting every
+    /// peer. Dropping the [`Broker`] does the same.
+    pub fn stop(&self) {
+        let _ = self.shutdown_sender.send(true);
+    }
 }
 
 pub(crate) enum PeerWriter {
@@ -84,37 +135,6 @@ impl PeerWriter {
             }
         }
     }
-}
-
-pub async fn start_broker(address: &str) -> Result<Broker> {
-    let listener = create_listener(resolve_address(address).await?)?;
-    let (event_sender, event_receiver) = mpsc::channel(BROKER_EVENT_CAPACITY);
-    let (shutdown_sender, shutdown_receiver) = watch::channel(false);
-    let instance_id = uuid::Uuid::new_v4().as_u128();
-    tokio::spawn(broker_loop(
-        event_receiver,
-        shutdown_receiver.clone(),
-        instance_id,
-    ));
-    tokio::spawn(accept_loop(
-        listener,
-        event_sender.clone(),
-        shutdown_receiver,
-    ));
-    Ok(Broker {
-        sender: event_sender,
-        shutdown_sender,
-        #[cfg(feature = "spawn")]
-        spawner: crate::spawn::create_spawner(address),
-    })
-}
-
-pub fn broker_is_running(broker: &Broker) -> bool {
-    !broker.sender.is_closed()
-}
-
-pub fn stop_broker(broker: &Broker) {
-    let _ = broker.shutdown_sender.send(true);
 }
 
 pub(crate) enum BrokerEvent {
@@ -207,6 +227,11 @@ struct TopicState {
     subscribers: SmallVec<[PeerId; 4]>,
 }
 
+struct WildcardSubscription {
+    pattern: Box<str>,
+    peer: PeerId,
+}
+
 struct BrokerState {
     instance_id: u128,
     publish_counter: u64,
@@ -217,6 +242,7 @@ struct BrokerState {
     topic_index: HashMap<Box<str>, u32>,
     topics: Vec<Option<TopicState>>,
     free_topics: Vec<u32>,
+    wildcards: Vec<WildcardSubscription>,
     bridges: BridgeRegistry,
     disconnect_sender: UnboundedSender<PeerId>,
 }
@@ -400,6 +426,7 @@ async fn broker_loop(
         topic_index: HashMap::new(),
         topics: Vec::new(),
         free_topics: Vec::new(),
+        wildcards: Vec::new(),
         bridges: BridgeRegistry::default(),
         disconnect_sender,
     };
@@ -657,6 +684,7 @@ fn remove_disconnected_peer(state: &mut BrokerState, peer_id: PeerId) {
 }
 
 fn purge_subscriptions(state: &mut BrokerState, peer_id: PeerId) {
+    state.wildcards.retain(|wildcard| wildcard.peer != peer_id);
     for index in 0..state.topics.len() {
         let is_empty = {
             let Some(topic) = state.topics[index].as_mut() else {
@@ -680,8 +708,48 @@ fn release_topic(state: &mut BrokerState, index: u32) {
     }
 }
 
+fn is_wildcard(topic: &str) -> bool {
+    topic
+        .split('/')
+        .any(|segment| segment == "+" || segment == "#")
+}
+
+/// Tests an MQTT-style topic filter against a concrete topic. A `+` segment
+/// matches exactly one level and a `#` segment matches the remaining levels
+/// (including none), so `sensors/+/temperature` matches `sensors/kitchen/
+/// temperature` and `sensors/#` matches both `sensors` and `sensors/kitchen/
+/// temperature`.
+fn topic_matches(pattern: &str, topic: &str) -> bool {
+    let mut pattern_segments = pattern.split('/');
+    let mut topic_segments = topic.split('/');
+    loop {
+        match (pattern_segments.next(), topic_segments.next()) {
+            (Some("#"), _) => return true,
+            (Some("+"), Some(_)) => continue,
+            (Some(pattern_segment), Some(topic_segment)) if pattern_segment == topic_segment => {
+                continue;
+            }
+            (None, None) => return true,
+            _ => return false,
+        }
+    }
+}
+
 fn subscribe_peer(state: &mut BrokerState, peer_id: PeerId, topic_name: &str) {
     if state.peers.get(peer_id).is_none() {
+        return;
+    }
+    if is_wildcard(topic_name) {
+        let already = state
+            .wildcards
+            .iter()
+            .any(|wildcard| wildcard.peer == peer_id && &*wildcard.pattern == topic_name);
+        if !already {
+            state.wildcards.push(WildcardSubscription {
+                pattern: Box::from(topic_name),
+                peer: peer_id,
+            });
+        }
         return;
     }
     let index = match state.topic_index.get(topic_name) {
@@ -711,6 +779,12 @@ fn subscribe_peer(state: &mut BrokerState, peer_id: PeerId, topic_name: &str) {
 }
 
 fn unsubscribe_peer(state: &mut BrokerState, peer_id: PeerId, topic_name: &str) {
+    if is_wildcard(topic_name) {
+        state
+            .wildcards
+            .retain(|wildcard| !(wildcard.peer == peer_id && &*wildcard.pattern == topic_name));
+        return;
+    }
     let Some(&index) = state.topic_index.get(topic_name) else {
         return;
     };
@@ -728,7 +802,7 @@ fn unsubscribe_peer(state: &mut BrokerState, peer_id: PeerId, topic_name: &str) 
 fn answer_introspection_requests(state: &mut BrokerState, topic_name: &str) -> Result<()> {
     if topic_name == BrokerContract::request_subscriptions_topic() {
         let (report_topic, mut payload) = BrokerContract::report_subscriptions();
-        payload.subscriptions = state
+        let mut subscriptions: Vec<(String, Vec<String>)> = state
             .topics
             .iter()
             .flatten()
@@ -748,6 +822,21 @@ fn answer_introspection_requests(state: &mut BrokerState, topic_name: &str) -> R
                 )
             })
             .collect();
+        let mut wildcard_groups: HashMap<&str, Vec<String>> = HashMap::new();
+        for wildcard in &state.wildcards {
+            if let Some(slot) = state.peers.get(wildcard.peer) {
+                wildcard_groups
+                    .entry(&wildcard.pattern)
+                    .or_default()
+                    .push(slot.name.to_string());
+            }
+        }
+        subscriptions.extend(
+            wildcard_groups
+                .into_iter()
+                .map(|(pattern, subscribers)| (pattern.to_string(), subscribers)),
+        );
+        payload.subscriptions = subscriptions;
         publish_from_broker(state, BROKER_ID, &report_topic, &payload.to_json()?)?;
     } else if topic_name == BrokerContract::request_peers_topic() {
         let (report_topic, mut payload) = BrokerContract::report_peers();
@@ -812,23 +901,35 @@ fn forward_to_bridges(
     Ok(())
 }
 
+fn send_to_peer(state: &BrokerState, peer_id: PeerId, control: bool, frame: &Frame) {
+    let Some(peer) = state.peers.get(peer_id) else {
+        return;
+    };
+    let queue = if control { &peer.control } else { &peer.data };
+    if let Err(TrySendError::Full(_)) = queue.try_send(frame.clone())
+        && control
+    {
+        let _ = state.disconnect_sender.send(peer_id);
+    }
+}
+
 fn deliver(state: &BrokerState, topic_name: &str, frame: &Frame) {
-    let Some(&index) = state.topic_index.get(topic_name) else {
-        return;
-    };
-    let Some(topic) = state.topics[index as usize].as_ref() else {
-        return;
-    };
     let control = topic_name.starts_with(CONTROL_TOPIC_PREFIX);
-    for &peer_id in &topic.subscribers {
-        let Some(peer) = state.peers.get(peer_id) else {
-            continue;
-        };
-        let queue = if control { &peer.control } else { &peer.data };
-        if let Err(TrySendError::Full(_)) = queue.try_send(frame.clone())
-            && control
-        {
-            let _ = state.disconnect_sender.send(peer_id);
+    let mut delivered: SmallVec<[PeerId; 8]> = SmallVec::new();
+    if let Some(&index) = state.topic_index.get(topic_name)
+        && let Some(topic) = state.topics[index as usize].as_ref()
+    {
+        for &peer_id in &topic.subscribers {
+            delivered.push(peer_id);
+            send_to_peer(state, peer_id, control, frame);
+        }
+    }
+    if !state.wildcards.is_empty() {
+        for wildcard in &state.wildcards {
+            if !delivered.contains(&wildcard.peer) && topic_matches(&wildcard.pattern, topic_name) {
+                delivered.push(wildcard.peer);
+                send_to_peer(state, wildcard.peer, control, frame);
+            }
         }
     }
 }
@@ -852,7 +953,9 @@ async fn open_broker_bridge(
         payload.target_address = target_address.clone();
         publish_from_broker(state, &requester, &topic, &payload.to_json()?)?;
     } else {
-        open_bridge_acked(&client, &target_address, &source_address, true).await?;
+        client
+            .open_bridge_acked(&target_address, &source_address, true)
+            .await?;
     }
     let commands = spawn_bridge(client, target_address.clone());
     state.bridges.insert(Bridge {

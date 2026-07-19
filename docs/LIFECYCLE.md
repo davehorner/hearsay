@@ -23,7 +23,7 @@ struct Responder;
 
 impl Lifecycle for Responder {
     async fn initialize(&mut self, client: &Client) {
-        let _ = subscribe(client, &[&MyContract::command_topic("all")]).await;
+        let _ = client.subscribe(&[&MyContract::command_topic("all")]).await;
     }
 
     async fn receive_message(&mut self, message: &Message, client: &Client) -> Option<Interrupt> {

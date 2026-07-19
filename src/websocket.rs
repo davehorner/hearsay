@@ -12,14 +12,19 @@ use tokio::{
 };
 use tokio_tungstenite::tungstenite;
 
-pub async fn start_websocket_listener(broker: &Broker, address: &str) -> Result<()> {
-    let listener = TcpListener::bind(resolve_address(address).await?).await?;
-    tokio::spawn(websocket_accept_loop(
-        listener,
-        broker.sender.clone(),
-        broker.shutdown_sender.subscribe(),
-    ));
-    Ok(())
+impl Broker {
+    /// Starts a WebSocket transport on `address`, so browser and WASM peers can
+    /// join this broker's bus. WebSocket peers speak the same wire protocol as
+    /// TCP peers and share the broker's subscription table.
+    pub async fn start_websocket_listener(&self, address: &str) -> Result<()> {
+        let listener = TcpListener::bind(resolve_address(address).await?).await?;
+        tokio::spawn(websocket_accept_loop(
+            listener,
+            self.sender.clone(),
+            self.shutdown_sender.subscribe(),
+        ));
+        Ok(())
+    }
 }
 
 async fn websocket_accept_loop(

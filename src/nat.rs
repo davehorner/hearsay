@@ -35,6 +35,20 @@ pub struct Rendezvous {
 }
 
 impl Rendezvous {
+    /// Starts a rendezvous server that pairs peers by session id, telling each
+    /// the other's observed public address. Dropping the returned value stops
+    /// the server.
+    pub async fn start(address: &str) -> Result<Rendezvous> {
+        let socket = UdpSocket::bind(address).await?;
+        let bound = socket.local_addr()?;
+        let (shutdown_sender, shutdown_receiver) = watch::channel(false);
+        tokio::spawn(rendezvous_loop(socket, shutdown_receiver));
+        Ok(Rendezvous {
+            address: bound,
+            shutdown: shutdown_sender,
+        })
+    }
+
     /// The address peers should register with.
     pub fn address(&self) -> SocketAddr {
         self.address
@@ -45,19 +59,6 @@ impl Drop for Rendezvous {
     fn drop(&mut self) {
         let _ = self.shutdown.send(true);
     }
-}
-
-/// Starts a rendezvous server that pairs peers by session id, telling each the
-/// other's observed public address.
-pub async fn start_rendezvous(address: &str) -> Result<Rendezvous> {
-    let socket = UdpSocket::bind(address).await?;
-    let bound = socket.local_addr()?;
-    let (shutdown_sender, shutdown_receiver) = watch::channel(false);
-    tokio::spawn(rendezvous_loop(socket, shutdown_receiver));
-    Ok(Rendezvous {
-        address: bound,
-        shutdown: shutdown_sender,
-    })
 }
 
 async fn rendezvous_loop(socket: UdpSocket, mut shutdown: watch::Receiver<bool>) {
@@ -123,7 +124,7 @@ pub async fn punch(socket: &UdpSocket, rendezvous: SocketAddr, session: u64) -> 
     Ok(peer)
 }
 
-/// Like [`punch`], but gives up after [`PEER_WAIT`] instead of retrying
+/// Like [`punch`], but gives up after a fixed wait instead of retrying
 /// registration forever.
 pub async fn punch_with_timeout(
     socket: &UdpSocket,

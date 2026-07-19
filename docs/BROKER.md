@@ -4,13 +4,13 @@ The broker is the message router: it accepts peer connections, maintains the sub
 
 ## 1. Startup
 
-`start_broker(address)` resolves the address with standard host resolution (`resolve_address`, preferring an IPv4 result), so `localhost` binds the loopback interface and hostnames work. Listening on all interfaces requires the explicit `0.0.0.0:port`. The protocol carries no authentication, so the bind address is the security boundary: local tools should bind loopback, and `0.0.0.0` belongs on trusted networks only (any peer that can reach the port can subscribe to every topic, publish, and request bridges).
+`Broker::start(address)` resolves the address with standard host resolution (`resolve_address`, preferring an IPv4 result), so `localhost` binds the loopback interface and hostnames work. Listening on all interfaces requires the explicit `0.0.0.0:port`. The protocol carries no authentication, so the bind address is the security boundary: local tools should bind loopback, and `0.0.0.0` belongs on trusted networks only (any peer that can reach the port can subscribe to every topic, publish, and request bridges).
 
 The listener itself is built with socket2 (`create_listener`): `SO_REUSEADDR`, keepalive (30s initial probe, 1s interval, 3 retries where the platform supports it), and a backlog of 1024. The configured socket is converted to a nonblocking std listener and then into a tokio `TcpListener`.
 
-Two tasks are spawned: `broker_loop` (the event loop) and `accept_loop` (which spawns a `connection_task` per accepted stream). `start_broker` returns a `Broker` holding the event-channel sender and a shutdown watch sender; `broker_is_running` reports whether the loop is still alive by checking the event sender. With the `spawn` feature, the `Broker` also carries the process spawner (see [SPAWN.md](SPAWN.md)).
+Two tasks are spawned: `broker_loop` (the event loop) and `accept_loop` (which spawns a `connection_task` per accepted stream). `Broker::start` returns a `Broker` holding the event-channel sender and a shutdown watch sender; `broker.is_running()` reports whether the loop is still alive by checking the event sender. With the `spawn` feature, the `Broker` also carries the process spawner (see [SPAWN.md](SPAWN.md)).
 
-The broker stops in two ways, with identical effect: `stop_broker(&broker)` sends the shutdown signal explicitly, and dropping the `Broker` drops the watch sender, which the loops observe the same way. Both accept loops (TCP and WebSocket) and the event loop exit, peer writer channels close, sockets shut, and connected clients observe the disconnect. Hold the `Broker` for as long as the bus should run.
+The broker stops in two ways, with identical effect: `broker.stop()` sends the shutdown signal explicitly, and dropping the `Broker` drops the watch sender, which the loops observe the same way. Both accept loops (TCP and WebSocket) and the event loop exit, peer writer channels close, sockets shut, and connected clients observe the disconnect. Hold the `Broker` for as long as the bus should run.
 
 ## 2. Connection tasks
 
@@ -28,7 +28,7 @@ When the read side dies, the task drops its shutdown sender. That resolves the o
 `broker_loop` owns all broker state as one plain struct, `BrokerState`:
 
 - `peers: Arena<PeerSlot>` holds each peer's name and its two bounded writer channels (control and data), addressed by `PeerId` (slot index plus generation). `peer_names` maps name to `PeerId` for `Hello` replacement.
-- `topic_index: HashMap<Box<str>, u32>` interns topic names to slots in `topics: Vec<Option<TopicState>>`; each topic's subscribers are a `SmallVec<[PeerId; 4]>`. Matching is exact string equality; there are no wildcards. A topic's slot is released to a free list when its last subscriber leaves, so the table cannot accumulate empty entries.
+- `topic_index: HashMap<Box<str>, u32>` interns topic names to slots in `topics: Vec<Option<TopicState>>`; each topic's subscribers are a `SmallVec<[PeerId; 4]>`. A topic's slot is released to a free list when its last subscriber leaves, so the table cannot accumulate empty entries. Exact-topic matching is the fast path: a publish hashes its topic once and walks that topic's subscriber list with no string scanning. Wildcard subscriptions (below) are held separately and tested only when present.
 - `origin_progress` implements cross-broker deduplication (section 6).
 - `bridges: BridgeRegistry`.
 - `disconnect_sender`, cloned into every writer task.
@@ -51,6 +51,8 @@ A publish frame is handled without deserializing or re-serializing the message:
 2. For text publishes, `answer_introspection_requests` checks the topic against the `BrokerContract` request topics and publishes the matching report (section 7).
 3. Unless the publish was local-only, a forward header is encoded once and paired with a slice of the same payload buffer, then handed to every bridge except the one matching the publisher (cycle prevention, section 6).
 4. `deliver` hashes the topic once to find its interned id, then walks the subscriber `PeerId` list and clones the shared frame into each peer's queue — a refcount bump per subscriber, no payload copies. Peers no longer in the arena are skipped silently.
+
+A subscription is either an exact topic or an MQTT-style wildcard pattern: `+` matches exactly one topic level and a trailing `#` matches the remaining levels, so `sensors/+/temperature` matches `sensors/kitchen/temperature` and `sensors/#` matches every topic beneath `sensors/`. `deliver` fans a publish to the exact subscribers of its topic and additionally to every wildcard subscriber whose pattern matches. Wildcard patterns are held separately from the exact index, so a topic with no wildcard subscribers pays nothing for the feature and only the registered patterns are tested per publish; the exact index stays the fast path.
 
 `Subscribe` and `Unsubscribe` only mutate the local subscription table. Subscriptions are deliberately not forwarded over bridges: cross-broker delivery is publish-driven (every non-local publish crosses every bridge), so forwarding subscriptions would only cause the remote broker to stream messages into a bridge client that never reads them.
 

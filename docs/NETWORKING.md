@@ -19,21 +19,21 @@ The transports are additive. A single broker can run TCP, WebSocket, and UDP lis
 ## 2. The UDP transport
 
 ```rust
-let broker = hearsay::start_broker("127.0.0.1:9612").await?;
-hearsay::start_udp_listener(&broker, "127.0.0.1:9613").await?;
+let broker = hearsay::Broker::start("127.0.0.1:9612").await?;
+broker.start_udp_listener("127.0.0.1:9613").await?;
 ```
 
 Over a stream transport a connection is a socket. UDP has no connections, so hearsay models each source address as a **virtual connection**: one listener socket demultiplexes every peer by its remote address, each with its own reliability endpoint. A UDP peer is driven through the same connection state machine as a TCP peer — it sends the same frames, beginning with `Hello` — but those frames travel inside the reliability protocol described in section 3 rather than one-to-one with datagrams.
 
 ```rust
-let client = hearsay::create_udp_client("player", "127.0.0.1:9613").await?;
-hearsay::udp_subscribe(&client, &["world/state"]).await?;
+let client = hearsay::UdpClient::connect("player", "127.0.0.1:9613").await?;
+client.subscribe(&["world/state"]).await?;
 
 // choose a guarantee per publish
-hearsay::udp_publish(&client, "input", &command, hearsay::Delivery::Unreliable).await?;
-hearsay::udp_publish(&client, "chat", &line, hearsay::Delivery::ReliableOrdered).await?;
+client.publish("input", &command, hearsay::Delivery::Unreliable).await?;
+client.publish("chat", &line, hearsay::Delivery::ReliableOrdered).await?;
 
-if let Some(message) = hearsay::next_udp_message(&client).await {
+if let Some(message) = client.next_message().await {
     // ...
 }
 ```
@@ -67,11 +67,11 @@ hearsay does not provide these. Anyone who can reach the transport can subscribe
 
 ## 5. Time primitives
 
-The reliability endpoint measures the smoothed round-trip time and jitter to its peer from acknowledgement timing, using Karn's algorithm so a retransmitted packet never skews the estimate. The UDP client exposes them as `udp_rtt_millis(&client)` (`None` until the first acknowledgement) and `udp_jitter_millis(&client)`. These are the raw measurements prediction, interpolation, and reconciliation build on; the tick clock and the policy that uses it stay in the layer above, coupled to the world model.
+The reliability endpoint measures the smoothed round-trip time and jitter to its peer from acknowledgement timing, using Karn's algorithm so a retransmitted packet never skews the estimate. The UDP client exposes them as `client.rtt_millis()` (`None` until the first acknowledgement) and `client.jitter_millis()`. These are the raw measurements prediction, interpolation, and reconciliation build on; the tick clock and the policy that uses it stay in the layer above, coupled to the world model.
 
 ## 6. NAT traversal (feature `nat`, experimental)
 
-Because clients connect outbound to the broker, hosting the broker on a publicly reachable machine already traverses NAT — that relay path is the recommended answer and needs no extra code. For direct peer-to-peer between two hosts behind separate NATs, the `nat` feature adds a rendezvous: `start_rendezvous(address)` pairs peers by session id and tells each the other's observed public address, and `punch(&socket, rendezvous, session)` registers, learns the peer's address, and sends a burst of datagrams to open the local NAT mapping.
+Because clients connect outbound to the broker, hosting the broker on a publicly reachable machine already traverses NAT — that relay path is the recommended answer and needs no extra code. For direct peer-to-peer between two hosts behind separate NATs, the `nat` feature adds a rendezvous: `Rendezvous::start(address)` pairs peers by session id and tells each the other's observed public address, and `punch(&socket, rendezvous, session)` registers, learns the peer's address, and sends a burst of datagrams to open the local NAT mapping.
 
 This is **experimental and unverified against real NATs** — it cannot be tested without two machines behind two NATs. The test validates only the coordination path on a single machine (registration, observed-address exchange, and a direct datagram once each side knows the other). Treat direct traversal as best-effort and fall back to the broker as a public relay when it fails.
 

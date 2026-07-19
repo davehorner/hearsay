@@ -7,8 +7,8 @@ WebSocket support is integrated into the broker rather than provided as a separa
 ## 1. Starting the listener
 
 ```rust
-let broker = hearsay::start_broker("127.0.0.1:9612").await?;
-hearsay::start_websocket_listener(&broker, "127.0.0.1:9613").await?;
+let broker = hearsay::Broker::start("127.0.0.1:9612").await?;
+broker.start_websocket_listener("127.0.0.1:9613").await?;
 ```
 
 `start_websocket_listener` binds its own address, resolved the same way as the TCP listener (standard host resolution, IPv4 preferred, so `localhost` binds loopback and `0.0.0.0` is the explicit all-interfaces opt-in), and spawns an accept loop that feeds the same broker event channel as the TCP listener. Each accepted connection goes through the tungstenite handshake and then `websocket_connection_task`, which mirrors the TCP connection task: it parses incoming frames, forwards them via the shared `process_incoming_frame`, and parks the sink half as the peer's writer (`PeerWriter::WebSocket`).
@@ -35,4 +35,4 @@ A WebSocket peer gets the same writer task, shutdown oneshot, and generation-che
 
 ## 4. WASM clients
 
-A browser client implements the four-step session above over the platform WebSocket API, and it depends on hearsay itself for the wire format: on `wasm32` targets the crate compiles down to the protocol surface (the `encode_*` helpers, `decode_message`, `Message`, `BrokerContract` and its payloads, and `read_batch`), with all the tokio-backed machinery and its dependencies compiled out. There is no byte-format mirroring and no gateway process: the WASM client builds frames with the helpers, sends them as binary messages, and decodes incoming binary messages with `decode_message`. CI checks the wasm32 build on every push.
+A browser client implements the four-step session above over the platform WebSocket API, and it depends on hearsay itself for the wire format: on `wasm32` targets the crate compiles down to the protocol surface (the `encode_*` helpers, `decode_message`, `Message` with its `read_batch` and `read` decoders, and `BrokerContract` and its payloads), with all the tokio-backed machinery and its dependencies compiled out. There is no byte-format mirroring and no gateway process: the WASM client builds frames with the helpers, sends them as binary messages, and decodes incoming binary messages with `decode_message`. CI checks the wasm32 build on every push.

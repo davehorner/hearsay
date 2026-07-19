@@ -1,7 +1,6 @@
 use hearsay::{
-    ClientSettings, Route, connect, create_client,
+    Broker, Client, ClientSettings, Route,
     enum2contract::{self, EnumContract},
-    next_message, publish, start_broker, subscribe,
 };
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -52,24 +51,30 @@ fn test_settings() -> ClientSettings {
 #[tokio::test(flavor = "multi_thread")]
 async fn contract_command_and_event_round_trip() -> hearsay::Result<()> {
     let broker_address = "127.0.0.1:9938";
-    let _broker = start_broker(broker_address).await?;
+    let _broker = Broker::start(broker_address).await?;
     let channel = "all";
 
-    let service = create_client("service", test_settings());
-    connect(&service, broker_address).await?;
-    subscribe(&service, &[&CounterContract::command_topic(channel)]).await?;
+    let service = Client::new("service", test_settings());
+    service.connect(broker_address).await?;
+    service
+        .subscribe(&[&CounterContract::command_topic(channel)])
+        .await?;
 
-    let operator = create_client("operator", test_settings());
-    connect(&operator, broker_address).await?;
-    subscribe(&operator, &[&CounterContract::event_topic(channel)]).await?;
+    let operator = Client::new("operator", test_settings());
+    operator.connect(broker_address).await?;
+    operator
+        .subscribe(&[&CounterContract::event_topic(channel)])
+        .await?;
 
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     let (command_topic, mut command_payload) = CounterContract::command(channel);
     command_payload.command = CounterCommand::Increment { amount: 5 };
-    publish(&operator, &command_topic, &command_payload, Route::Global).await?;
+    operator
+        .publish(&command_topic, &command_payload, Route::Global)
+        .await?;
 
-    let message = tokio::time::timeout(Duration::from_secs(5), next_message(&service))
+    let message = tokio::time::timeout(Duration::from_secs(5), service.next_message())
         .await?
         .expect("expected a command message");
     assert_eq!(message.topic(), CounterContract::command_topic(channel));
@@ -84,9 +89,11 @@ async fn contract_command_and_event_round_trip() -> hearsay::Result<()> {
     };
     let (event_topic, mut event_payload) = CounterContract::event(channel);
     event_payload.event = CounterEvent::Incremented { total: amount };
-    publish(&service, &event_topic, &event_payload, Route::Global).await?;
+    service
+        .publish(&event_topic, &event_payload, Route::Global)
+        .await?;
 
-    let message = tokio::time::timeout(Duration::from_secs(5), next_message(&operator))
+    let message = tokio::time::timeout(Duration::from_secs(5), operator.next_message())
         .await?
         .expect("expected an event message");
     assert_eq!(message.topic(), CounterContract::event_topic(channel));
