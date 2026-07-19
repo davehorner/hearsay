@@ -64,7 +64,7 @@ pub enum PingPongContract {
 
 Generated per variant:
 
-- `CommandPayload { command: PingPongCommand }` with `to_json()` and `from_json()`.
+- `CommandPayload { command: PingPongCommand }` with both JSON (`to_json`/`from_json`) and postcard binary (`to_bytes`/`from_bytes`) conversion methods.
 - `PingPongContract::command_topic(channel: &str) -> String`, substituting each `{placeholder}`.
 - `PingPongContract::command(channel: &str) -> (String, CommandPayload)`, returning the topic and a default payload ready to mutate.
 
@@ -96,7 +96,7 @@ match message.topic() {
 }
 ```
 
-A payload published with `publish` arrives as postcard binary, so the subscriber decodes it with `message.read::<CommandPayload>()`. The generated payload structs derive `Serialize` and `Deserialize`, so this works directly. When JSON is wanted instead (a browser or WASM peer, or a cross-version consumer), publish with `client.publish_json(&topic, &payload, route)` and decode with `CommandPayload::from_json(message.text().unwrap_or_default())`. enum2contract still generates `to_json`/`from_json` on every payload struct for that path.
+A payload published with `publish` arrives as postcard binary, so the subscriber decodes it with `message.read::<CommandPayload>()`. enum2contract's generated `to_bytes`/`from_bytes` use the same postcard encoding, so a `publish`ed payload is byte-for-byte what `to_bytes` produces, and `CommandPayload::from_bytes(message.bytes().unwrap_or_default())` decodes the identical bytes; `message.read` is just the generic form of the same call. When JSON is wanted instead (a browser or WASM peer, or a cross-version consumer), publish with `client.publish_json(&topic, &payload, route)` and decode with `message.read_json::<CommandPayload>()` or the generated `CommandPayload::from_json(message.text().unwrap_or_default())`.
 
 ## 5. The broker's own contract
 
