@@ -81,7 +81,7 @@ async fn websocket_and_tcp_peers_interoperate() -> hearsay::Result<()> {
     })
     .await?;
     assert_eq!(message.topic(), "from/tcp");
-    let received: TestPayload = serde_json::from_str(message.text().unwrap())?;
+    let received: TestPayload = message.read()?;
     assert_eq!(received, payload);
     Ok(())
 }

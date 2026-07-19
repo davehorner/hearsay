@@ -187,18 +187,46 @@ impl Client {
         Ok(())
     }
 
-    /// Publishes `payload` to `topic`, serialized as JSON.
+    /// Publishes `payload` to `topic`, serialized with [postcard] into a compact
+    /// binary frame. This is the default typed path.
     ///
-    /// This is the typed path that pairs with contract topic accessors and is
-    /// the format browser and WASM peers read most easily. For a compact binary
-    /// encoding of the same typed value use [`Client::publish_postcard`]; for a
-    /// value already encoded as bytes use [`Client::publish_bytes`].
+    /// Binary is the default because it is the smallest and cheapest encoding
+    /// for the common case of Rust services that share their message types.
+    /// postcard is not self-describing, so both ends must agree on the type; when
+    /// they cannot (a browser or WASM peer, or a consumer on a different schema
+    /// version) reach for [`Client::publish_json`] instead. Subscribers decode
+    /// this with [`Message::read`].
     ///
-    /// Delivery is best-effort: a subscriber that is disconnected or too far
-    /// behind may never see the message. `route` selects whether the message
-    /// crosses broker bridges ([`Route::Global`]) or stays on the local broker
-    /// ([`Route::Local`]).
+    /// The payload is serialized straight into the frame buffer, so there is no
+    /// intermediate allocation. Delivery is best-effort: a subscriber that is
+    /// disconnected or too far behind may never see the message. `route` selects
+    /// whether the message crosses broker bridges ([`Route::Global`]) or stays on
+    /// the local broker ([`Route::Local`]).
+    ///
+    /// [postcard]: https://docs.rs/postcard
     pub async fn publish(
+        &self,
+        topic: impl AsRef<str>,
+        payload: &impl Serialize,
+        route: Route,
+    ) -> Result<()> {
+        let mut buffer = begin_publish_frame(
+            topic.as_ref(),
+            FLAG_BINARY | route_flags(route == Route::Local),
+        )?;
+        postcard::to_io(payload, (&mut buffer).writer())?;
+        let frame = finish_frame(buffer)?;
+        self.send_frame(Frame::single(frame)).await
+    }
+
+    /// Publishes `payload` to `topic`, serialized as JSON text.
+    ///
+    /// JSON is the second-class path: prefer [`Client::publish`] (binary) for
+    /// typed Rust-to-Rust traffic, and choose JSON when a peer needs a
+    /// self-describing, schema-tolerant format, such as a browser or WASM client
+    /// or a consumer on a different version of the types. Subscribers decode this
+    /// with [`Message::read_json`], or read the raw string with [`Message::text`].
+    pub async fn publish_json(
         &self,
         topic: impl AsRef<str>,
         payload: &impl Serialize,
@@ -210,9 +238,10 @@ impl Client {
         self.send_frame(Frame::single(frame)).await
     }
 
-    /// Publishes an already-serialized JSON string to `topic`, skipping the
-    /// serialization step of [`Client::publish`].
-    pub async fn publish_json(
+    /// Publishes an already-serialized text `payload` to `topic` as a text
+    /// frame, skipping serialization. Useful for forwarding a JSON string a tool
+    /// or UI already produced; subscribers read it with [`Message::text`].
+    pub async fn publish_text(
         &self,
         topic: impl AsRef<str>,
         payload: &str,
@@ -222,25 +251,6 @@ impl Client {
         buffer.put_slice(payload.as_bytes());
         let frame = finish_frame(buffer)?;
         self.send_frame(Frame::single(frame)).await
-    }
-
-    /// Publishes `payload` to `topic`, serialized with [postcard] into a compact
-    /// binary frame.
-    ///
-    /// This is the typed binary path: it carries the same strongly-typed values
-    /// as [`Client::publish`] but without the size and encoding cost of JSON,
-    /// which makes it the better default for high-frequency native-to-native
-    /// traffic. Subscribers decode it with [`Message::read`].
-    ///
-    /// [postcard]: https://docs.rs/postcard
-    pub async fn publish_postcard(
-        &self,
-        topic: impl AsRef<str>,
-        payload: &impl Serialize,
-        route: Route,
-    ) -> Result<()> {
-        let bytes = postcard::to_allocvec(payload)?;
-        self.publish_bytes(topic, &bytes, route).await
     }
 
     /// Publishes raw bytes to `topic` as a binary message, with no

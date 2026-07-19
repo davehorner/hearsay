@@ -1,6 +1,6 @@
 ﻿[package]
 name = "hearsay"
-version = "0.2.0"
+version = "0.3.0"
 authors = ["Matthew Berger <matthewjordanberger@gmail.com>"]
 description = """
 A message broker and client for topic-based pub/sub messaging over TCP, built on tokio, with broker bridging, websockets, process spawning, and strongly typed enum contracts.
@@ -28,7 +28,7 @@ websockets = ["dep:tokio-tungstenite", "dep:futures-util"]
 [dependencies]
 bytes = "1.4"
 enum2contract = "0.3"
-postcard = { version = "1.0.4", features = ["alloc"] }
+postcard = { version = "1.0.4", features = ["alloc", "use-std"] }
 serde = { version = "1.0", features = ["derive"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]

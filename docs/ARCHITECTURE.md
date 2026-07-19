@@ -6,7 +6,7 @@ All file paths are relative to the repository root.
 
 ## 1. What hearsay is
 
-hearsay lets Rust programs talk to each other. One process hosts a broker; any number of processes connect to it as clients over TCP (or WebSocket, with the `websockets` feature) and exchange messages through topic-based pub/sub. Topics are exact-match strings. Payloads are JSON text or raw bytes. Brokers can be bridged so that messages flow between machines. With the `spawn` feature, the broker also owns and supervises the client app processes themselves.
+hearsay lets Rust programs talk to each other. One process hosts a broker; any number of processes connect to it as clients over TCP (or WebSocket, with the `websockets` feature) and exchange messages through topic-based pub/sub. Topics are exact-match strings. Payloads default to compact binary (postcard) but can also be JSON text or raw bytes. Brokers can be bridged so that messages flow between machines. With the `spawn` feature, the broker also owns and supervises the client app processes themselves.
 
 ## 2. Module layout
 
@@ -54,12 +54,12 @@ Every background task is tied to the value that owns its state, so dropping the 
 
 ## 5. Locking discipline
 
-The broker has no locks. The client's publish path has none either: the peer id is immutable after creation, and the live connection handle sits in an `ArcSwapOption<Connection>`, so a publish is an atomic load, one frame encode, and a channel send. The client's two locks guard only the cold paths, and they are never held at the same time:
+The broker has no locks. The client's publish path has none either: the peer id is immutable after creation, and the live connection handle sits in an `ArcSwapOption<Connection>`, so a publish is an atomic load, one frame encode, and a channel send. The client holds two mutexes, and no path ever acquires both at once:
 
 - `ClientShared.cold: Mutex<ColdState>` guards the subscription caches, the broker address, and the reconnection-task flag. It is touched by `subscribe`/`unsubscribe`, `connect`, and the reconnection task, never by publishing.
-- The receiver lives in its own slot, `ClientShared.receiver: Mutex<Option<Receiver<Message>>>`. `next_message` locks it for the potentially long `recv().await`; reconnection installs a new receiver through the same slot.
+- The receive channel lives inside the connection itself, `Connection.inbound: Mutex<Receiver<Message>>`. `next_message` loads the current connection and locks that receiver for the potentially long `recv().await`. A reconnect swaps in a whole new `Connection` with its own receiver, so the receiver moves atomically with the connection.
 
-Because every code path acquires at most one of the two locks at a time, lock-order deadlocks are impossible by construction. Holding the receiver mutex across `recv().await` is intentional and cancel-safe: if the caller's timeout cancels the future, the guard drops and the receiver stays in the slot.
+Because every code path acquires at most one mutex at a time, lock-order deadlocks are impossible by construction. Holding the receiver mutex across `recv().await` is intentional and cancel-safe: if the caller's timeout cancels the future, the guard drops and the connection is untouched. Liveness is a single source of truth: an `AtomicBool` on the connection that the reader and writer tasks clear when they exit. `is_connected` and the reconnection task read it, and nothing ever stores `None` back into the connection slot, so a message drained from a dead connection can never clobber a newer one.
 
 ## 6. Features
 

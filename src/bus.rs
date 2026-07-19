@@ -21,8 +21,25 @@ pub trait Publisher: Sync {
         route: Route,
     ) -> impl Future<Output = Result<()>> + Send;
 
-    /// Publishes `value` to `topic`, serialized as JSON.
+    /// Publishes `value` to `topic`, serialized with postcard into a binary
+    /// message. This is the default typed path; use [`Publisher::publish_json`]
+    /// when a self-describing, schema-tolerant encoding is needed instead.
     fn publish<T: Serialize + Sync>(
+        &self,
+        topic: &str,
+        value: &T,
+        route: Route,
+    ) -> impl Future<Output = Result<()>> + Send {
+        async move {
+            let payload = postcard::to_allocvec(value)?;
+            self.publish_encoded(topic, &payload, true, route).await
+        }
+    }
+
+    /// Publishes `value` to `topic`, serialized as JSON text. The second-class
+    /// counterpart to [`Publisher::publish`], for peers that need a
+    /// self-describing format.
+    fn publish_json<T: Serialize + Sync>(
         &self,
         topic: &str,
         value: &T,
@@ -42,6 +59,17 @@ pub trait Publisher: Sync {
         route: Route,
     ) -> impl Future<Output = Result<()>> + Send {
         self.publish_encoded(topic, payload, true, route)
+    }
+
+    /// Publishes an already-serialized text `payload` to `topic` as a text
+    /// message.
+    fn publish_text(
+        &self,
+        topic: &str,
+        payload: &str,
+        route: Route,
+    ) -> impl Future<Output = Result<()>> + Send {
+        self.publish_encoded(topic, payload.as_bytes(), false, route)
     }
 }
 

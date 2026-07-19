@@ -47,7 +47,7 @@ async fn udp_client_and_tcp_peer_interoperate() -> hearsay::Result<()> {
         .await?
         .expect("tcp peer should receive the udp publish");
     assert_eq!(message.topic(), "from/udp");
-    let received: TestPayload = serde_json::from_str(message.text().unwrap())?;
+    let received: TestPayload = message.read()?;
     assert_eq!(received, payload);
 
     tcp_client
@@ -58,7 +58,7 @@ async fn udp_client_and_tcp_peer_interoperate() -> hearsay::Result<()> {
         .await?
         .expect("udp peer should receive the tcp publish");
     assert_eq!(message.topic(), "from/tcp");
-    let received: TestPayload = serde_json::from_str(message.text().unwrap())?;
+    let received: TestPayload = message.read()?;
     assert_eq!(received, payload);
     Ok(())
 }
@@ -156,7 +156,7 @@ async fn a_large_reliable_message_fragments_and_reassembles_over_udp() -> hearsa
         .await?
         .expect("large reliable message should reassemble");
     assert_eq!(message.topic(), "big");
-    let received: Vec<u32> = serde_json::from_str(message.text().unwrap())?;
+    let received: Vec<u32> = message.read()?;
     assert_eq!(received, big);
     Ok(())
 }

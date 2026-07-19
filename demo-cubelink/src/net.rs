@@ -157,12 +157,9 @@ async fn network_main(
                 let Some(message) = message else {
                     break;
                 };
-                let Some(text) = message.text() else {
-                    continue;
-                };
                 match message.topic() {
                     INPUT_TOPIC => {
-                        if let Ok(update) = serde_json::from_str::<InputMessage>(text)
+                        if let Ok(update) = message.read::<InputMessage>()
                             && update.id != my_id
                         {
                             let _ = to_game.send(NetEvent::Input {
@@ -172,7 +169,7 @@ async fn network_main(
                         }
                     }
                     STATE_TOPIC => {
-                        if let Ok(update) = serde_json::from_str::<StateMessage>(text) {
+                        if let Ok(update) = message.read::<StateMessage>() {
                             let _ = to_game.send(NetEvent::State {
                                 id: update.id,
                                 position: update.position,
@@ -180,7 +177,7 @@ async fn network_main(
                         }
                     }
                     CHAT_TOPIC => {
-                        if let Ok(update) = serde_json::from_str::<ChatMessage>(text)
+                        if let Ok(update) = message.read::<ChatMessage>()
                             && update.id != my_id
                         {
                             let _ = to_game.send(NetEvent::Chat {

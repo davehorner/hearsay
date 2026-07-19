@@ -127,9 +127,27 @@ impl UdpClient {
         Ok(())
     }
 
-    /// Publishes `payload` to `topic` as JSON with the chosen [`Delivery`]
-    /// guarantee.
+    /// Publishes `payload` to `topic` as postcard binary with the chosen
+    /// [`Delivery`] guarantee. This is the default typed path; subscribers decode
+    /// it with [`Message::read`]. Use [`UdpClient::publish_json`] for a
+    /// self-describing encoding.
     pub async fn publish(
+        &self,
+        topic: impl AsRef<str>,
+        payload: &impl Serialize,
+        delivery: Delivery,
+    ) -> Result<()> {
+        let bytes = postcard::to_allocvec(payload)?;
+        let frame = encode_publish_binary(topic.as_ref(), &bytes, false)?;
+        self.commands
+            .send(Command::Publish { frame, delivery })
+            .await
+            .map_err(|_| Error::NotConnected)
+    }
+
+    /// Publishes `payload` to `topic` as JSON text with the chosen [`Delivery`]
+    /// guarantee, the second-class counterpart to [`UdpClient::publish`].
+    pub async fn publish_json(
         &self,
         topic: impl AsRef<str>,
         payload: &impl Serialize,

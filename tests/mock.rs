@@ -23,7 +23,7 @@ async fn records_publishes() {
     let published = bus.published();
     assert_eq!(published.len(), 2);
     assert_eq!(published[0].topic, "greetings");
-    assert!(!published[0].binary);
+    assert!(published[0].binary);
     assert_eq!(published[0].route, Route::Global);
     assert_eq!(published[1].topic, "blob");
     assert!(published[1].binary);

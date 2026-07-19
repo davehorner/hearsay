@@ -83,18 +83,20 @@ payload.command = PingPongCommand::Ping;
 client.publish(&topic, &payload, hearsay::Route::Global).await?;
 ```
 
-Receive by matching the topic and deserializing the payload struct:
+Receive by matching the topic and decoding the payload struct:
 
 ```rust
 match message.topic() {
     topic if PingPongContract::command_topic("broadcast") == topic => {
-        if let Ok(payload) = CommandPayload::from_json(message.text().unwrap_or_default()) {
+        if let Ok(payload) = message.read::<CommandPayload>() {
             // handle payload.command
         }
     }
     _ => {}
 }
 ```
+
+A payload published with `publish` arrives as postcard binary, so the subscriber decodes it with `message.read::<CommandPayload>()`. The generated payload structs derive `Serialize` and `Deserialize`, so this works directly. When JSON is wanted instead (a browser or WASM peer, or a cross-version consumer), publish with `client.publish_json(&topic, &payload, route)` and decode with `CommandPayload::from_json(message.text().unwrap_or_default())`. enum2contract still generates `to_json`/`from_json` on every payload struct for that path.
 
 ## 5. The broker's own contract
 

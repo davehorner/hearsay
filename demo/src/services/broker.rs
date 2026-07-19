@@ -234,7 +234,7 @@ async fn execute_runtime_command(
 ) {
     match command {
         RuntimeCommand::Publish { topic, message } => {
-            let _ = client.publish_json(&topic, &message, hearsay::Route::Global).await;
+            let _ = client.publish_text(&topic, &message, hearsay::Route::Global).await;
         }
         RuntimeCommand::PublishBytes { topic, bytes } => {
             let _ = client.publish_bytes(&topic, &bytes, hearsay::Route::Global).await;

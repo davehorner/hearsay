@@ -505,8 +505,7 @@ async fn handle_peer_frame(
             let Ok(topic_name) = std::str::from_utf8(&frozen[topic.clone()]) else {
                 return Ok(());
             };
-            let binary = flags & FLAG_BINARY != 0;
-            if !binary {
+            if topic_name.starts_with(CONTROL_TOPIC_PREFIX) {
                 answer_introspection_requests(state, topic_name)?;
             }
             if flags & FLAG_LOCAL_ONLY == 0 {
@@ -550,10 +549,7 @@ async fn handle_peer_frame(
             let Ok(topic_name) = std::str::from_utf8(&frozen[topic.clone()]) else {
                 return Ok(());
             };
-            let binary = flags & FLAG_BINARY != 0;
-            if !binary {
-                answer_introspection_requests(state, topic_name)?;
-            }
+            answer_introspection_requests(state, topic_name)?;
             let mut extended: SmallVec<[u128; 8]> =
                 visited_bytes.chunks_exact(16).map(read_u128).collect();
             extended.push(state.instance_id);
@@ -915,21 +911,31 @@ fn send_to_peer(state: &BrokerState, peer_id: PeerId, control: bool, frame: &Fra
 
 fn deliver(state: &BrokerState, topic_name: &str, frame: &Frame) {
     let control = topic_name.starts_with(CONTROL_TOPIC_PREFIX);
+    let exact = state
+        .topic_index
+        .get(topic_name)
+        .and_then(|&index| state.topics[index as usize].as_ref());
+
+    if state.wildcards.is_empty() {
+        if let Some(topic) = exact {
+            for &peer_id in &topic.subscribers {
+                send_to_peer(state, peer_id, control, frame);
+            }
+        }
+        return;
+    }
+
     let mut delivered: SmallVec<[PeerId; 8]> = SmallVec::new();
-    if let Some(&index) = state.topic_index.get(topic_name)
-        && let Some(topic) = state.topics[index as usize].as_ref()
-    {
+    if let Some(topic) = exact {
         for &peer_id in &topic.subscribers {
             delivered.push(peer_id);
             send_to_peer(state, peer_id, control, frame);
         }
     }
-    if !state.wildcards.is_empty() {
-        for wildcard in &state.wildcards {
-            if !delivered.contains(&wildcard.peer) && topic_matches(&wildcard.pattern, topic_name) {
-                delivered.push(wildcard.peer);
-                send_to_peer(state, wildcard.peer, control, frame);
-            }
+    for wildcard in &state.wildcards {
+        if !delivered.contains(&wildcard.peer) && topic_matches(&wildcard.pattern, topic_name) {
+            delivered.push(wildcard.peer);
+            send_to_peer(state, wildcard.peer, control, frame);
         }
     }
 }

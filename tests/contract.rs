@@ -78,7 +78,7 @@ async fn contract_command_and_event_round_trip() -> hearsay::Result<()> {
         .await?
         .expect("expected a command message");
     assert_eq!(message.topic(), CounterContract::command_topic(channel));
-    let received_command = CommandPayload::from_json(message.text().unwrap())?;
+    let received_command = message.read::<CommandPayload>()?;
     assert_eq!(
         received_command.command,
         CounterCommand::Increment { amount: 5 }
@@ -97,7 +97,7 @@ async fn contract_command_and_event_round_trip() -> hearsay::Result<()> {
         .await?
         .expect("expected an event message");
     assert_eq!(message.topic(), CounterContract::event_topic(channel));
-    let received_event = EventPayload::from_json(message.text().unwrap())?;
+    let received_event = message.read::<EventPayload>()?;
     assert_eq!(received_event.event, CounterEvent::Incremented { total: 5 });
     Ok(())
 }

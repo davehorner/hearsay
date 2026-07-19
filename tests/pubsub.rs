@@ -40,7 +40,7 @@ async fn round_trip() -> hearsay::Result<()> {
         .await?
         .expect("expected a message");
     assert_eq!(message.topic(), topic);
-    let received: TestPayload = serde_json::from_str(message.text().unwrap())?;
+    let received: TestPayload = message.read()?;
     assert_eq!(received, payload);
     Ok(())
 }

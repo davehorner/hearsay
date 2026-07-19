@@ -51,7 +51,7 @@ impl Message {
     }
 
     /// Decodes the binary payload as a single [postcard]-encoded value of type
-    /// `T`, the receive half of [`crate::Client::publish_postcard`].
+    /// `T`, the receive half of the default [`crate::Client::publish`].
     ///
     /// Returns an error if the message carries text rather than binary, or if
     /// the bytes do not decode into `T`.
@@ -62,6 +62,19 @@ impl Message {
             .bytes()
             .ok_or_else(|| Error::from("message has no binary payload"))?;
         Ok(postcard::from_bytes(bytes)?)
+    }
+
+    /// Decodes the text payload as a single JSON value of type `T`, the receive
+    /// half of [`crate::Client::publish_json`].
+    ///
+    /// Returns an error if the message carries binary rather than text, or if
+    /// the text does not decode into `T`.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn read_json<T: DeserializeOwned>(&self) -> Result<T> {
+        let text = self
+            .text()
+            .ok_or_else(|| Error::from("message has no text payload"))?;
+        Ok(serde_json::from_str(text)?)
     }
 
     /// Decodes the binary payload as a batch of `T` values, the receive half of

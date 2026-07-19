@@ -12,7 +12,7 @@
   <code>cargo add hearsay</code>
 </p>
 
-hearsay is topic-based pub/sub for Rust, built on [tokio](https://tokio.rs). One process hosts the broker with a single call; any number of others connect and exchange JSON or binary messages over TCP. The broker is a value your program holds, not a separate server to run.
+hearsay is topic-based pub/sub for Rust, built on [tokio](https://tokio.rs). One process hosts the broker with a single call; any number of others connect and exchange binary or JSON messages over TCP. The broker is a value your program holds, not a separate server to run.
 
 - **Typed contracts**: message schemas are strongly typed enums via [enum2contract](https://github.com/matthewjberger/enum2contract), re-exported so contracts need no extra dependency. Topics accept any `AsRef<str>`, but naming them through a contract's generated topic accessors (for example `MyContract::event_topic(channel)`) keeps topic strings checked at compile time instead of scattered as literals
 - **Bridging**: brokers connect to each other
@@ -39,7 +39,7 @@ client.subscribe(&["greetings"]).await?;
 client.publish("greetings", &"hello".to_string(), hearsay::Route::Global).await?;
 
 if let Some(message) = client.next_message().await {
-    if let Some(text) = message.text() {
+    if let Ok(text) = message.read::<String>() {
         println!("{text}");
     }
 }
@@ -63,7 +63,7 @@ All are additive; the default build is the TCP broker, client, contracts, batchi
 ## WebSockets
 
 ```toml
-hearsay = { version = "0.2", features = ["websockets"] }
+hearsay = { version = "0.3", features = ["websockets"] }
 ```
 
 ```rust
@@ -76,7 +76,7 @@ WebSocket peers speak the same wire protocol as TCP peers and share the broker's
 ## UDP
 
 ```toml
-hearsay = { version = "0.2", features = ["udp"] }
+hearsay = { version = "0.3", features = ["udp"] }
 ```
 
 ```rust
@@ -94,7 +94,7 @@ UDP peers share the broker's subscription table with TCP and WebSocket peers, an
 ## Spawn
 
 ```toml
-hearsay = { version = "0.2", features = ["spawn"] }
+hearsay = { version = "0.3", features = ["spawn"] }
 ```
 
 With the `spawn` feature, the broker owns its client app processes: they are killed when the broker is dropped, restarted according to a per-app policy, and each child receives the broker address in the `HEARSAY_BROKER` environment variable.
@@ -126,7 +126,7 @@ batch.flush(&client).await?;         // or flush manually
 let updates: Vec<EntityUpdate> = message.read_batch()?;
 ```
 
-Batches travel as binary postcard frames. The same typed binary path is available for single values through `client.publish_postcard(topic, &value, Route::Global)` and `message.read::<T>()`, the compact counterpart to `publish`. `publish` itself is JSON, which stays the default: it is the right choice for typed contracts and for browser and WASM peers that decode with `serde_json`.
+Batches travel as binary postcard frames. That same typed binary encoding is what `publish` itself uses for single values: `client.publish(topic, &value, Route::Global)` serializes one value with postcard and `message.read::<T>()` decodes it. `publish` is the default because postcard is the smallest and cheapest encoding for the common case of Rust services that share their types; it is not self-describing, so both ends must agree on the type and version. When a peer needs a self-describing format instead (a browser or WASM client, or a consumer on a different version of the types), `publish_json` sends JSON text and `message.read_json::<T>()` decodes it. `publish_text` forwards an already-serialized string and `publish_bytes` sends raw bytes.
 
 ## Delivery and backpressure
 

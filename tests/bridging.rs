@@ -92,7 +92,7 @@ async fn bridged_brokers_deliver_messages() -> hearsay::Result<()> {
         }
     })
     .await?;
-    let received: TestPayload = serde_json::from_str(message.text().unwrap())?;
+    let received: TestPayload = message.read()?;
     assert_eq!(received, payload);
     Ok(())
 }
@@ -140,7 +140,7 @@ async fn local_route_does_not_cross_bridges() -> hearsay::Result<()> {
         }
     })
     .await?;
-    let received: TestPayload = serde_json::from_str(local_message.text().unwrap())?;
+    let received: TestPayload = local_message.read()?;
     assert_eq!(received, payload);
 
     let remote_message = tokio::time::timeout(Duration::from_secs(2), async {
